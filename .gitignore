@@ -3,6 +3,6 @@ node_modules
 server/availability.db*
 server/.dev.vars
 server/d1-import.sql
-server/d1-password-reset.sql
+server/d1-recovery-key.sql
 .wrangler/
 server/src/generated/prisma/

@@ -16,7 +16,6 @@ From this repository root:
    npm install
    ```
 2. Copy `server/.dev.vars.example` to `server/.dev.vars`. Set `SESSION_SECRET` to a unique random value of at least 32 characters. Keep these development values:
-   - `APP_URL=http://localhost:5173`
    - `CORS_ORIGINS=http://localhost:5173`
    - `SESSION_COOKIE_SAME_SITE=lax`
    - `SESSION_COOKIE_SECURE=false`
@@ -44,27 +43,22 @@ From the backend repository root:
    ```
 2. Copy the returned `database_id` into `server/wrangler.jsonc`, replacing the all-zero placeholder. Keep the binding name `DB` and database name `availability-planner`.
 3. Configure the production values in `server/wrangler.jsonc`:
-   - `APP_URL`: the exact Pages origin, e.g. `https://your-site.pages.dev`
    - `CORS_ORIGINS`: the same exact origin (comma-separate additional trusted origins)
    - `SESSION_COOKIE_SAME_SITE`: `none`
    - `SESSION_COOKIE_SECURE`: `true`
-   - `MAIL_FROM`: a sender address verified by your email provider
-4. Apply the D1 schema:
+4. Apply any new D1 migrations:
    ```bash
    npm run db:migrate:remote
    ```
 5. Add production secrets:
    ```bash
    npx wrangler secret put SESSION_SECRET --config server/wrangler.jsonc
-   npx wrangler secret put RESEND_API_KEY --config server/wrangler.jsonc
    ```
    Use the existing `SESSION_SECRET` from the former API if you want imported active sessions to remain valid; otherwise users will need to sign in again. Do not commit `.dev.vars`, secrets, or SQL exports.
 6. Deploy:
    ```bash
    npm run deploy
    ```
-
-`RESEND_API_KEY` is needed for password-reset emails. Configure a Resend account, verify the sending domain, and set `MAIL_FROM` accordingly. Without a valid provider configuration, recovery requests still return the same generic response to avoid revealing account existence, while the delivery failure is logged in Worker logs.
 
 ## Import existing SQLite data into D1
 
@@ -97,15 +91,14 @@ The D1 migration creates the schema and Worker rate-limit table; the export scri
 Existing users have Argon2id hashes. That legacy hashing workload does not fit reliably within Cloudflare Workers Free's 10 ms CPU limit, so the Worker deliberately does not attempt to verify those hashes. The imported schedules, groups, users, and sessions are preserved, but legacy users must set a new password:
 
 - Users with a still-valid imported session can use the in-app password migration prompt. Session continuity requires importing `user_sessions` (the exporter does this) and setting the same `SESSION_SECRET` in Cloudflare.
-- Users with an email address can use **Forgot password** after the Worker has been configured to send through Resend.
-- For an account without an email address and no valid session, the administrator can generate a one-time SQL password update:
+- Existing users also need a recovery key. For each account, the administrator can generate one:
   ```bash
-  npm run db:reset-password -w server -- <username>
-  npx wrangler d1 execute availability-planner --remote --config server/wrangler.jsonc --file=server/d1-password-reset.sql
+  npm run db:recovery-key -w server -- <username>
+  npx wrangler d1 execute availability-planner --remote --config server/wrangler.jsonc --file=server/d1-recovery-key.sql
   ```
-  Share the chosen password with the account owner through a private channel, then securely delete the ignored SQL file. The generated password is hashed before it is written to SQL.
+  The command displays the recovery key once and writes only its hash to the SQL file. Confirm Wrangler returns the intended username, share the key privately with that account owner, then securely delete the ignored SQL file. The user can then use **Forgot password** to set a new password. For an account without a valid session, this also replaces the legacy Argon2 password.
 
-New and reset passwords are stored as PBKDF2-SHA-256 hashes using 600,000 iterations via Web Crypto. The Worker enforces credentialed CORS, HTTP-only signed sessions, D1-backed rate limits, and the existing API route behavior.
+New accounts receive a high-entropy recovery key displayed only once after signup. D1 stores only its SHA-256 hash. Recovery keys are single-use: successful recovery consumes the key, changes the password, and signs out existing sessions. New and recovered passwords are stored as PBKDF2-SHA-256 hashes using 100,000 iterations via Web Crypto, the iteration ceiling supported by Cloudflare Workers' Web Crypto implementation. The Worker enforces credentialed CORS, HTTP-only signed sessions, D1-backed rate limits, and the existing API route behavior.
 
 ## Useful commands
 

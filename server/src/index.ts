@@ -26,7 +26,7 @@ function requireAuth(req: Request, res: Response, next: (error?: unknown) => voi
 }
 
 const encoder = new TextEncoder();
-const PASSWORD_ITERATIONS = 600_000;
+const PASSWORD_ITERATIONS = 100_000;
 function base64(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
@@ -52,7 +52,7 @@ async function verifyPassword(password: string, encoded: string): Promise<boolea
   const [algorithm, digest, iterationsText, saltText, expectedText] = encoded.split("$");
   if (algorithm !== "pbkdf2" || digest !== "sha256" || !/^\d+$/.test(iterationsText || "")) return false;
   const iterations = Number(iterationsText);
-  if (iterations < 100_000 || iterations > 1_000_000 || !saltText || !expectedText) return false;
+  if (iterations !== PASSWORD_ITERATIONS || !saltText || !expectedText) return false;
   const salt = fromBase64(saltText);
   const expected = fromBase64(expectedText);
   const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
@@ -247,21 +247,6 @@ async function hasConflictingGroupAssignments(groups: { groupId: string; slots: 
   }
   return false;
 }
-async function sendResetEmail(env: WorkerEnv, to: string, url: string) {
-  if (!env.RESEND_API_KEY) throw new Error("RESEND_API_KEY is not configured.");
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      from: env.MAIL_FROM || "Availability Planner <no-reply@example.com>",
-      to: [to],
-      subject: "Reset your Availability Planner password",
-      text: `Use this link within 30 minutes to reset your password: ${url}\nIf you did not request this, ignore this email.`
-    })
-  });
-  if (!response.ok) throw new Error(`Email provider returned HTTP ${response.status}.`);
-}
-
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.post("/api/auth/register", authLimiter, asyncRoute(async (req, res) => {
   const schema = z.object({ username: usernameSchema, password: z.string().min(12).max(128) });
@@ -269,17 +254,24 @@ app.post("/api/auth/register", authLimiter, asyncRoute(async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "Username must be 3–24 letters/numbers/underscores; password must be 12–128 characters." });
   const username = parsed.data.username.toLowerCase();
   if (await prisma.user.findUnique({ where: { username } })) return res.status(409).json({ error: "Username is already taken." });
-  const user = await prisma.user.create({ data: { username, passwordHash: await hashPassword(parsed.data.password) } });
+  const recoveryKey = randomToken();
+  const user = await prisma.user.create({
+    data: {
+      username,
+      passwordHash: await hashPassword(parsed.data.password),
+      recoveryKeyHash: await sha256(recoveryKey)
+    }
+  });
   await prisma.standardSlot.createMany({ data: Array.from({ length: 672 }, (_, i) => ({ userId: user.id, day: Math.floor(i / 96), slot: i % 96, available: false })) });
   req.session.userId = user.id;
-  res.status(201).json({ user: { id: user.id, username: user.username, passwordResetRequired: false } });
+  res.status(201).json({ user: { id: user.id, username: user.username, passwordResetRequired: false }, recoveryKey });
 }));
 app.post("/api/auth/login", authLimiter, asyncRoute(async (req, res) => {
   const parsed = z.object({ username: z.string().trim().min(1).max(100), password: z.string().min(1).max(128) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Enter username and password." });
   const user = await prisma.user.findUnique({ where: { username: parsed.data.username.toLowerCase() } });
   if (user?.passwordHash.startsWith("$argon2")) {
-    return res.status(409).json({ error: "This account needs a password reset before it can sign in. Use Forgot password, or sign in with an existing session to choose a new password." });
+    return res.status(409).json({ error: "This account needs a new password. Use your recovery key, or sign in with an existing session to choose one." });
   }
   if (!user || !(await verifyPassword(parsed.data.password, user.passwordHash))) return res.status(401).json({ error: "Invalid username or password." });
   await new Promise<void>((resolve, reject) => req.session.regenerate(err => err ? reject(err) : resolve()));
@@ -306,31 +298,28 @@ app.post("/api/auth/migrate-password", requireAuth, asyncRoute(async (req, res) 
   await prisma.user.update({ where: { id: req.session.userId! }, data: { passwordHash: await hashPassword(parsed.data.password) } });
   res.json({ message: "Your password was updated." });
 }));
-app.post("/api/auth/forgot-password", resetLimiter, asyncRoute(async (req, res) => {
-  const parsed = z.object({ email: z.string().trim().email().max(254) }).safeParse(req.body);
-  if (!parsed.success) return res.status(200).json({ message: "If that account exists, recovery instructions will be sent." });
-  const user = await prisma.user.findUnique({ where: { email: parsed.data.email.toLowerCase() } });
-  if (user?.email) {
-    const rawToken = randomToken();
-    const tokenHash = await sha256(rawToken);
-    await prisma.passwordResetToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 30 * 60 * 1000) } });
-    try { await sendResetEmail(req.env, user.email, `${req.env.APP_URL}/reset-password?token=${rawToken}`); }
-    catch (error) { console.error("Reset email delivery failed", error); }
+app.post("/api/auth/recover", resetLimiter, asyncRoute(async (req, res) => {
+  const parsed = z.object({
+    username: usernameSchema,
+    recoveryKey: z.string().trim().min(20).max(200),
+    password: z.string().min(12).max(128)
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Enter your username, recovery key, and a new password of at least 12 characters." });
+
+  const user = await prisma.user.findUnique({ where: { username: parsed.data.username.toLowerCase() }, select: { id: true, recoveryKeyHash: true } });
+  const keyHash = await sha256(parsed.data.recoveryKey);
+  if (!user?.recoveryKeyHash || user.recoveryKeyHash !== keyHash) {
+    return res.status(400).json({ error: "Username or recovery key is invalid." });
   }
-  res.json({ message: "If that account exists, recovery instructions will be sent." });
-}));
-app.post("/api/auth/reset-password", resetLimiter, asyncRoute(async (req, res) => {
-  const parsed = z.object({ token: z.string().min(20).max(200), password: z.string().min(12).max(128) }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Invalid token or password. Passwords must be at least 12 characters." });
-  const tokenHash = await sha256(parsed.data.token);
-  const record = await prisma.passwordResetToken.findUnique({ where: { tokenHash } });
-  if (!record || record.usedAt || record.expiresAt < new Date()) return res.status(400).json({ error: "Reset link is invalid or expired." });
-  await prisma.$transaction([
-    prisma.user.update({ where: { id: record.userId }, data: { passwordHash: await hashPassword(parsed.data.password) } }),
-    prisma.passwordResetToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
-    prisma.passwordResetToken.updateMany({ where: { userId: record.userId, id: { not: record.id }, usedAt: null }, data: { usedAt: new Date() } })
-  ]);
-  res.json({ message: "Password updated. You can now log in." });
+
+  const updated = await prisma.user.updateMany({
+    where: { id: user.id, recoveryKeyHash: user.recoveryKeyHash },
+    data: { passwordHash: await hashPassword(parsed.data.password), recoveryKeyHash: null }
+  });
+  if (updated.count !== 1) return res.status(400).json({ error: "Username or recovery key is invalid." });
+
+  await req.env.DB.prepare(`DELETE FROM "user_sessions" WHERE json_extract("sess", '$.userId') = ?1`).bind(user.id).run();
+  res.json({ message: "Password updated. Sign in with your new password." });
 }));
 
 app.get("/api/schedule/standard", requireAuth, asyncRoute(async (req, res) => res.json({ slots: flatten(await getStandard(req.session.userId!)) })));

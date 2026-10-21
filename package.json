@@ -11,7 +11,7 @@
     "db:migrate:local": "npm run db:migrate:local -w server",
     "db:migrate:remote": "npm run db:migrate:remote -w server",
     "db:export-sqlite": "npm run db:export-sqlite -w server",
-    "db:reset-password": "npm run db:reset-password -w server",
+    "db:recovery-key": "npm run db:recovery-key -w server",
     "deploy": "npm run deploy -w server"
   }
 }

@@ -13,6 +13,7 @@ model User {
   username            String          @unique
   email               String?         @unique
   passwordHash        String
+  recoveryKeyHash     String?
   createdAt           DateTime        @default(now())
   biweeklyAnchorWeekStart DateTime?
   standardSlots       StandardSlot[]

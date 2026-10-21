@@ -1,7 +1,4 @@
 SESSION_SECRET=replace-with-a-long-random-secret-at-least-32-characters
-APP_URL=http://localhost:5173
 CORS_ORIGINS=http://localhost:5173
 SESSION_COOKIE_SAME_SITE=lax
 SESSION_COOKIE_SECURE=false
-RESEND_API_KEY=
-MAIL_FROM=Availability Planner <no-reply@example.com>

@@ -16,7 +16,7 @@
     "db:migrate:local": "wrangler d1 migrations apply availability-planner --local",
     "db:migrate:remote": "wrangler d1 migrations apply availability-planner --remote",
     "db:export-sqlite": "node scripts/export-sqlite.mjs",
-    "db:reset-password": "node scripts/create-password-reset-sql.mjs"
+    "db:recovery-key": "node scripts/create-recovery-key-sql.mjs"
   },
   "dependencies": {
     "@prisma/adapter-d1": "^7.10.1",

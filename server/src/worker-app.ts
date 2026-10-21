@@ -3,12 +3,9 @@ import type { D1Database } from "@cloudflare/workers-types";
 export interface WorkerEnv {
   DB: D1Database;
   SESSION_SECRET: string;
-  APP_URL: string;
   CORS_ORIGINS: string;
   SESSION_COOKIE_SAME_SITE: "lax" | "strict" | "none";
   SESSION_COOKIE_SECURE: string;
-  RESEND_API_KEY?: string;
-  MAIL_FROM?: string;
 }
 
 export interface WorkerRequest {
