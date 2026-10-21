@@ -1,107 +1,72 @@
-import "dotenv/config";
-import express, { NextFunction, Request, Response } from "express";
-import session, { Store } from "express-session";
-import cors from "cors";
-import rateLimit from "express-rate-limit";
-import argon2 from "argon2";
-import crypto from "node:crypto";
-import nodemailer from "nodemailer";
-import { PrismaClient } from "@prisma/client";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { PrismaD1 } from "@prisma/adapter-d1";
+import { PrismaClient } from "./generated/prisma/client";
 import { z } from "zod";
+import { WorkerApp, rateLimit, type WorkerEnv, type WorkerRequest as Request, type WorkerResponse as Response } from "./worker-app.js";
 
-const app = express();
-const prisma = new PrismaClient();
-class PrismaSessionStore extends Store {
-  get(sid: string, callback: (err: any, session?: session.SessionData | null) => void) {
-    void prisma.sessionStore.findUnique({ where: { sid } }).then(async stored => {
-      if (!stored || stored.expire <= new Date()) {
-        if (stored) await prisma.sessionStore.deleteMany({ where: { sid } });
-        callback(null, null);
-        return;
-      }
-      let data: unknown;
-      try {
-        data = JSON.parse(stored.sess);
-      } catch (error) {
-        callback(error);
-        return;
-      }
-      if (typeof data !== "object" || data === null || Array.isArray(data)) {
-        callback(new Error("Stored session data is invalid."));
-        return;
-      }
-      callback(null, data as session.SessionData);
-    }).catch(callback);
+const prismaContext = new AsyncLocalStorage<PrismaClient>();
+const prisma = new Proxy({} as PrismaClient, {
+  get(_target, property) {
+    const client = prismaContext.getStore();
+    if (!client) throw new Error("Prisma Client was accessed outside a Worker request.");
+    const value = Reflect.get(client, property, client) as unknown;
+    return typeof value === "function" ? value.bind(client) : value;
   }
+});
+const app = new WorkerApp();
+const authLimiter = rateLimit(10, 15 * 60 * 1000);
+const resetLimiter = rateLimit(5, 60 * 60 * 1000);
 
-  set(sid: string, data: session.SessionData, callback?: (err?: any) => void) {
-    let serialized: string | undefined;
-    try {
-      serialized = JSON.stringify(data);
-    } catch (error) {
-      callback?.(error);
-      return;
-    }
-    if (!serialized) {
-      callback?.(new Error("Session data could not be serialized."));
-      return;
-    }
-    const expire = data.cookie.expires ?? new Date(Date.now() + (data.cookie.originalMaxAge ?? 0));
-    void prisma.sessionStore.upsert({
-      where: { sid },
-      create: { sid, sess: serialized, expire },
-      update: { sess: serialized, expire }
-    }).then(() => callback?.()).catch(error => callback?.(error));
-  }
-
-  destroy(sid: string, callback?: (err?: any) => void) {
-    void prisma.sessionStore.deleteMany({ where: { sid } }).then(() => callback?.()).catch(error => callback?.(error));
-  }
-
-  touch(sid: string, data: session.SessionData, callback?: (err?: Error) => void) {
-    const expire = data.cookie.expires ?? new Date(Date.now() + (data.cookie.originalMaxAge ?? 0));
-    void prisma.sessionStore.updateMany({ where: { sid }, data: { expire } }).then(() => callback?.()).catch(error => callback?.(error));
-  }
+function asyncRoute(fn: (req: Request, res: Response, next: (error?: unknown) => void) => Promise<unknown>) {
+  return (req: Request, res: Response, next: (error?: unknown) => void) => Promise.resolve(fn(req, res, next)).catch(next);
 }
-const port = Number(process.env.PORT || 4000);
-const appUrl = process.env.APP_URL || "http://localhost:5173";
-const isProduction = process.env.NODE_ENV === "production";
-const corsOrigins = new Set((process.env.CORS_ORIGINS || appUrl).split(",").map(origin => origin.trim()).filter(Boolean));
-const sessionCookieSameSite = z.enum(["lax", "strict", "none"]).parse(process.env.SESSION_COOKIE_SAME_SITE || "lax");
-const sessionCookieSecure = isProduction || process.env.SESSION_COOKIE_SECURE === "true";
-if (sessionCookieSameSite === "none" && !sessionCookieSecure) {
-  throw new Error("SESSION_COOKIE_SECURE=true is required when SESSION_COOKIE_SAME_SITE=none.");
-}
-if (isProduction && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
-  throw new Error("SESSION_SECRET must be at least 32 characters in production.");
-}
-
-app.set("trust proxy", 1);
-app.use(cors({ origin: (origin, callback) => callback(null, !origin || corsOrigins.has(origin)), credentials: true }));
-app.use(express.json({ limit: "100kb" }));
-app.use(session({
-  store: new PrismaSessionStore(),
-  name: "availability.sid",
-  secret: process.env.SESSION_SECRET || "development-only-change-this-secret-32chars",
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    secure: sessionCookieSecure,
-    sameSite: sessionCookieSameSite,
-    maxAge: 1000 * 60 * 60 * 24 * 7
-  }
-}));
-
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
-const resetLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false });
-
-function asyncRoute(fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>) {
-  return (req: Request, res: Response, next: NextFunction) => Promise.resolve(fn(req, res, next)).catch(next);
-}
-function requireAuth(req: Request, res: Response, next: NextFunction) {
+function requireAuth(req: Request, res: Response, next: (error?: unknown) => void) {
   if (!req.session.userId) return res.status(401).json({ error: "Please log in." });
   next();
+}
+
+const encoder = new TextEncoder();
+const PASSWORD_ITERATIONS = 600_000;
+function base64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+function fromBase64(value: string): Uint8Array {
+  const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(binary, character => character.charCodeAt(0));
+}
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
+async function hashPassword(password: string): Promise<string> {
+  const salt = new Uint8Array(new ArrayBuffer(16));
+  crypto.getRandomValues(salt);
+  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PASSWORD_ITERATIONS }, key, 256);
+  return `pbkdf2$sha256$${PASSWORD_ITERATIONS}$${base64(salt)}$${base64(new Uint8Array(bits))}`;
+}
+async function verifyPassword(password: string, encoded: string): Promise<boolean> {
+  const [algorithm, digest, iterationsText, saltText, expectedText] = encoded.split("$");
+  if (algorithm !== "pbkdf2" || digest !== "sha256" || !/^\d+$/.test(iterationsText || "")) return false;
+  const iterations = Number(iterationsText);
+  if (iterations < 100_000 || iterations > 1_000_000 || !saltText || !expectedText) return false;
+  const salt = fromBase64(saltText);
+  const expected = fromBase64(expectedText);
+  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: toArrayBuffer(salt), iterations }, key, expected.length * 8));
+  if (bits.length !== expected.length) return false;
+  let mismatch = 0;
+  for (let index = 0; index < bits.length; index++) mismatch |= bits[index] ^ expected[index];
+  return mismatch === 0;
+}
+async function sha256(value: string): Promise<string> {
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(value)))].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+function randomToken(): string {
+  return base64(crypto.getRandomValues(new Uint8Array(32)));
 }
 const usernameSchema = z.string().trim().min(3).max(24).regex(/^[a-zA-Z0-9_]+$/, "Use letters, numbers, and underscores only.");
 const slotsSchema = z.array(z.object({ day: z.number().int().min(0).max(6), slot: z.number().int().min(0).max(95), available: z.boolean() })).max(672);
@@ -282,23 +247,19 @@ async function hasConflictingGroupAssignments(groups: { groupId: string; slots: 
   }
   return false;
 }
-async function sendResetEmail(to: string, url: string) {
-  const host = process.env.SMTP_HOST;
-  if (!host) {
-    if (isProduction) throw new Error("Email delivery is not configured.");
-    console.info(`[DEV ONLY] Password reset link for ${to}: ${url}`);
-    return;
-  }
-  const transporter = nodemailer.createTransport({
-    host, port: Number(process.env.SMTP_PORT || 587),
-    secure: Number(process.env.SMTP_PORT || 587) === 465,
-    auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined
+async function sendResetEmail(env: WorkerEnv, to: string, url: string) {
+  if (!env.RESEND_API_KEY) throw new Error("RESEND_API_KEY is not configured.");
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from: env.MAIL_FROM || "Availability Planner <no-reply@example.com>",
+      to: [to],
+      subject: "Reset your Availability Planner password",
+      text: `Use this link within 30 minutes to reset your password: ${url}\nIf you did not request this, ignore this email.`
+    })
   });
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM || "no-reply@example.com",
-    to, subject: "Reset your Availability Planner password",
-    text: `Use this link within 30 minutes to reset your password: ${url}\nIf you did not request this, ignore this email.`
-  });
+  if (!response.ok) throw new Error(`Email provider returned HTTP ${response.status}.`);
 }
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
@@ -308,47 +269,64 @@ app.post("/api/auth/register", authLimiter, asyncRoute(async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "Username must be 3–24 letters/numbers/underscores; password must be 12–128 characters." });
   const username = parsed.data.username.toLowerCase();
   if (await prisma.user.findUnique({ where: { username } })) return res.status(409).json({ error: "Username is already taken." });
-  const user = await prisma.user.create({ data: { username, passwordHash: await argon2.hash(parsed.data.password, { type: argon2.argon2id }) } });
+  const user = await prisma.user.create({ data: { username, passwordHash: await hashPassword(parsed.data.password) } });
   await prisma.standardSlot.createMany({ data: Array.from({ length: 672 }, (_, i) => ({ userId: user.id, day: Math.floor(i / 96), slot: i % 96, available: false })) });
   req.session.userId = user.id;
-  res.status(201).json({ user: { id: user.id, username: user.username } });
+  res.status(201).json({ user: { id: user.id, username: user.username, passwordResetRequired: false } });
 }));
 app.post("/api/auth/login", authLimiter, asyncRoute(async (req, res) => {
   const parsed = z.object({ username: z.string().trim().min(1).max(100), password: z.string().min(1).max(128) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Enter username and password." });
   const user = await prisma.user.findUnique({ where: { username: parsed.data.username.toLowerCase() } });
-  if (!user || !(await argon2.verify(user.passwordHash, parsed.data.password))) return res.status(401).json({ error: "Invalid username or password." });
+  if (user?.passwordHash.startsWith("$argon2")) {
+    return res.status(409).json({ error: "This account needs a password reset before it can sign in. Use Forgot password, or sign in with an existing session to choose a new password." });
+  }
+  if (!user || !(await verifyPassword(parsed.data.password, user.passwordHash))) return res.status(401).json({ error: "Invalid username or password." });
   await new Promise<void>((resolve, reject) => req.session.regenerate(err => err ? reject(err) : resolve()));
   req.session.userId = user.id;
-  res.json({ user: { id: user.id, username: user.username } });
+  res.json({ user: { id: user.id, username: user.username, passwordResetRequired: false } });
 }));
-app.post("/api/auth/logout", requireAuth, (req, res) => req.session.destroy(() => { res.clearCookie("availability.sid"); res.status(204).end(); }));
+app.post("/api/auth/logout", requireAuth, asyncRoute(async (req, res) => {
+  await new Promise<void>((resolve, reject) => req.session.destroy(error => error ? reject(error) : resolve()));
+  res.clearCookie("availability.sid");
+  res.status(204).end();
+}));
 app.get("/api/auth/me", asyncRoute(async (req, res) => {
   if (!req.session.userId) return res.json({ user: null });
-  const user = await prisma.user.findUnique({ where: { id: req.session.userId }, select: { id: true, username: true } });
-  res.json({ user });
+  const user = await prisma.user.findUnique({ where: { id: req.session.userId }, select: { id: true, username: true, passwordHash: true } });
+  if (user) res.json({ user: { id: user.id, username: user.username, passwordResetRequired: user.passwordHash.startsWith("$argon2") } });
+  else res.json({ user: null });
+}));
+app.post("/api/auth/migrate-password", requireAuth, asyncRoute(async (req, res) => {
+  const parsed = z.object({ password: z.string().min(12).max(128) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Password must be 12–128 characters." });
+  const user = await prisma.user.findUnique({ where: { id: req.session.userId! }, select: { passwordHash: true } });
+  if (!user) return res.status(401).json({ error: "Please log in." });
+  if (!user.passwordHash.startsWith("$argon2")) return res.status(409).json({ error: "This account does not need a password migration." });
+  await prisma.user.update({ where: { id: req.session.userId! }, data: { passwordHash: await hashPassword(parsed.data.password) } });
+  res.json({ message: "Your password was updated." });
 }));
 app.post("/api/auth/forgot-password", resetLimiter, asyncRoute(async (req, res) => {
   const parsed = z.object({ email: z.string().trim().email().max(254) }).safeParse(req.body);
   if (!parsed.success) return res.status(200).json({ message: "If that account exists, recovery instructions will be sent." });
   const user = await prisma.user.findUnique({ where: { email: parsed.data.email.toLowerCase() } });
   if (user?.email) {
-    const rawToken = crypto.randomBytes(32).toString("base64url");
-    const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+    const rawToken = randomToken();
+    const tokenHash = await sha256(rawToken);
     await prisma.passwordResetToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 30 * 60 * 1000) } });
-    try { await sendResetEmail(user.email, `${appUrl}/reset-password?token=${rawToken}`); }
-    catch (e) { console.error("Reset email delivery failed", e); }
+    try { await sendResetEmail(req.env, user.email, `${req.env.APP_URL}/reset-password?token=${rawToken}`); }
+    catch (error) { console.error("Reset email delivery failed", error); }
   }
   res.json({ message: "If that account exists, recovery instructions will be sent." });
 }));
 app.post("/api/auth/reset-password", resetLimiter, asyncRoute(async (req, res) => {
   const parsed = z.object({ token: z.string().min(20).max(200), password: z.string().min(12).max(128) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid token or password. Passwords must be at least 12 characters." });
-  const tokenHash = crypto.createHash("sha256").update(parsed.data.token).digest("hex");
+  const tokenHash = await sha256(parsed.data.token);
   const record = await prisma.passwordResetToken.findUnique({ where: { tokenHash } });
   if (!record || record.usedAt || record.expiresAt < new Date()) return res.status(400).json({ error: "Reset link is invalid or expired." });
   await prisma.$transaction([
-    prisma.user.update({ where: { id: record.userId }, data: { passwordHash: await argon2.hash(parsed.data.password, { type: argon2.argon2id }) } }),
+    prisma.user.update({ where: { id: record.userId }, data: { passwordHash: await hashPassword(parsed.data.password) } }),
     prisma.passwordResetToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
     prisma.passwordResetToken.updateMany({ where: { userId: record.userId, id: { not: record.id }, usedAt: null }, data: { usedAt: new Date() } })
   ]);
@@ -676,8 +654,23 @@ app.get("/api/groups/:id/schedule/:weekStart", requireAuth, asyncRoute(async (re
   res.json({ group: { id: group.id, name: group.name, color: group.color }, members: grids.map(g => g.username), slots });
 }));
 
-app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  console.error(err);
-  res.status(500).json({ error: "An unexpected server error occurred." });
-});
-app.listen(port, () => console.log(`Availability Planner API listening on http://localhost:${port}`));
+export default {
+  async fetch(request: globalThis.Request, env: WorkerEnv): Promise<globalThis.Response> {
+    if (typeof env.SESSION_SECRET !== "string" || env.SESSION_SECRET.length < 32) {
+      return globalThis.Response.json({ error: "SESSION_SECRET must be at least 32 characters." }, { status: 500 });
+    }
+    const sameSite = z.enum(["lax", "strict", "none"]).safeParse(env.SESSION_COOKIE_SAME_SITE);
+    if (!sameSite.success || (sameSite.data === "none" && env.SESSION_COOKIE_SECURE !== "true")) {
+      return globalThis.Response.json({ error: "Invalid session cookie configuration." }, { status: 500 });
+    }
+    const client = new PrismaClient({ adapter: new PrismaD1(env.DB) });
+    try {
+      return await prismaContext.run(client, () => app.fetch(request, env));
+    } catch (error) {
+      console.error("Worker request failed", error);
+      return globalThis.Response.json({ error: "An unexpected server error occurred." }, { status: 500 });
+    } finally {
+      await client.$disconnect();
+    }
+  }
+};

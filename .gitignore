@@ -1,3 +1,8 @@
 node_modules
 .env
 server/availability.db*
+server/.dev.vars
+server/d1-import.sql
+server/d1-password-reset.sql
+.wrangler/
+server/src/generated/prisma/

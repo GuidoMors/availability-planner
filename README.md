@@ -1,64 +1,119 @@
 # Availability Planner API
 
-The API is an Express and Prisma application using SQLite for application data and server-side sessions. The React/Vite client is maintained in the sibling `commontime` folder.
+The API is a TypeScript Cloudflare Worker using Prisma ORM with Cloudflare D1. The React/Vite client is maintained in the sibling `commontime` repository and is deployed separately to Cloudflare Pages. The old SQLite file is retained locally as the source for a deliberate D1 data import; it is not used by the Worker.
 
 ## Requirements
 
-- Node.js 20+
+- Node.js 22.13 or newer (includes the built-in SQLite module used by the data migration tools)
+- A Cloudflare account for D1/Worker deployment
 
-## Run locally
+## Local development
 
 From this repository root:
 
-1. Copy `.env.example` to `.env`. Set `SESSION_SECRET` to a unique random value; keep the SQLite `DATABASE_URL` as provided unless you want the database in another location.
-2. Install dependencies:
+1. Install packages:
    ```bash
    npm install
    ```
-3. Create/update the SQLite schema and generate Prisma Client:
+2. Copy `server/.dev.vars.example` to `server/.dev.vars`. Set `SESSION_SECRET` to a unique random value of at least 32 characters. Keep these development values:
+   - `APP_URL=http://localhost:5173`
+   - `CORS_ORIGINS=http://localhost:5173`
+   - `SESSION_COOKIE_SAME_SITE=lax`
+   - `SESSION_COOKIE_SECURE=false`
+3. Create a local D1 database and apply the schema:
    ```bash
-   npm run db:migrate
+   npm run db:migrate:local
    ```
-4. Start the API:
+4. Start the Worker:
    ```bash
    npm run dev
    ```
+   Wrangler serves the local API at `http://localhost:8787`.
+5. In `commontime`, run `npm install` and `npm run dev`. Vite proxies `/api` to the local Worker at port 8787.
 
-The API listens on `http://localhost:4000`. The database file is `server/availability.db`; the SQLite session store is in that same file. To run the client locally, start it from `commontime`; its Vite server proxies `/api` requests to this API.
+Local D1 data is separate from `server/availability.db`. To use the imported schedules locally, export the SQLite data and execute the resulting SQL against local D1 as described in the migration section below.
 
-## Database and deployments
+## Create and deploy Cloudflare D1 + Worker
 
-- SQLite does not need a separate database server, Docker, or database hosting. The API process reads and writes the database file directly.
-- Back up `server/availability.db` regularly and verify you can restore it.
-- The API host must provide persistent storage at the path specified by `DATABASE_URL`. Ephemeral storage can lose the database on restart or redeploy. Run a single API instance because SQLite is a local file, not a shared multi-instance database.
-- The earlier PostgreSQL migration history is archived in `server/prisma/migrations-postgresql`; use the SQLite migrations in `server/prisma/migrations` for new SQLite databases.
-- The PostgreSQL database previously used in this development workspace was copied into its local SQLite database. This database file is ignored by Git and is not included in a clone or deployment. The PostgreSQL source was left unchanged; the two databases do not stay in sync. Back up and verify your SQLite file before retiring the old PostgreSQL copy.
-- Existing PostgreSQL data is not automatically imported by the SQLite migrations. For a different database or deployment, use a deliberate data migration and verify it before switching traffic.
+From the backend repository root:
 
-Use `npm run db:deploy` to apply already-created migrations in a production environment. `npm run db:migrate` is for local development and can create migrations.
+1. Authenticate with Wrangler and create the database:
+   ```bash
+   npx wrangler login
+   npx wrangler d1 create availability-planner
+   ```
+2. Copy the returned `database_id` into `server/wrangler.jsonc`, replacing the all-zero placeholder. Keep the binding name `DB` and database name `availability-planner`.
+3. Configure the production values in `server/wrangler.jsonc`:
+   - `APP_URL`: the exact Pages origin, e.g. `https://your-site.pages.dev`
+   - `CORS_ORIGINS`: the same exact origin (comma-separate additional trusted origins)
+   - `SESSION_COOKIE_SAME_SITE`: `none`
+   - `SESSION_COOKIE_SECURE`: `true`
+   - `MAIL_FROM`: a sender address verified by your email provider
+4. Apply the D1 schema:
+   ```bash
+   npm run db:migrate:remote
+   ```
+5. Add production secrets:
+   ```bash
+   npx wrangler secret put SESSION_SECRET --config server/wrangler.jsonc
+   npx wrangler secret put RESEND_API_KEY --config server/wrangler.jsonc
+   ```
+   Use the existing `SESSION_SECRET` from the former API if you want imported active sessions to remain valid; otherwise users will need to sign in again. Do not commit `.dev.vars`, secrets, or SQL exports.
+6. Deploy:
+   ```bash
+   npm run deploy
+   ```
 
-## Configuration
+`RESEND_API_KEY` is needed for password-reset emails. Configure a Resend account, verify the sending domain, and set `MAIL_FROM` accordingly. Without a valid provider configuration, recovery requests still return the same generic response to avoid revealing account existence, while the delivery failure is logged in Worker logs.
 
-- `DATABASE_URL`: SQLite file URL; the example points to `server/availability.db`.
-- `SESSION_SECRET`: use a long, unique secret of at least 32 characters in production.
-- `APP_URL`: client origin used by the API, defaulting to `http://localhost:5173`.
-- `CORS_ORIGINS`: comma-separated client origins allowed to make credentialed API requests.
-- For a deployed Cloudflare Pages client, set its `VITE_API_BASE_URL` to the API's HTTPS origin. Set `APP_URL` and `CORS_ORIGINS` to the exact Pages origin and use `SESSION_COOKIE_SAME_SITE=none` and `SESSION_COOKIE_SECURE=true`. A Pages site using `localhost` reaches the visitor's computer, not your backend.
-- Configure SMTP settings to send password reset emails. Without SMTP, reset links are only logged in development; never use console delivery in production.
-- Use HTTPS in production. Session cookies are HTTP-only and secure in production.
+## Import existing SQLite data into D1
 
-## API features
+The existing `server/availability.db` is ignored by Git and stays unchanged by this procedure. Back it up before migrating. The importer refuses to export a database with missing tables or foreign-key violations.
 
-- Username/password registration and login using Argon2id password hashes. Email is optional and only needed for email-based password recovery; accounts without an email cannot recover a forgotten password.
-- Session-based authentication; passwords and password hashes are never returned by the API.
-- Password reset tokens are hashed, single-use, and expire after 30 minutes.
-- Standard weekly availability with 672 quarter-hour slots.
-- Alternating biweekly overrides anchored to a selected Monday, plus one-off week overrides. Unchanged slots inherit the regular weekly schedule.
-- Group memberships, shared availability, and group-owner-assigned schedules.
-- Authenticated by-username profile schedules, including inspected users' group memberships and scheduled group sessions.
+1. Create the remote D1 database and apply the schema as above.
+2. From the backend repository root, export a data-only SQL file:
+   ```bash
+   npm run db:export-sqlite
+   ```
+   It creates ignored `server/d1-import.sql`; this contains account and schedule data, so do not commit or share it.
+3. Import the data:
+   ```bash
+   npx wrangler d1 execute availability-planner --remote --config server/wrangler.jsonc --file=server/d1-import.sql
+   ```
+   For local development, use `--local` in place of `--remote`:
+   ```bash
+   npx wrangler d1 execute availability-planner --local --config server/wrangler.jsonc --file=server/d1-import.sql
+   ```
+4. Verify row counts before switching the Pages site to the Worker. For example:
+   ```bash
+   npx wrangler d1 execute availability-planner --remote --config server/wrangler.jsonc --command="SELECT (SELECT COUNT(*) FROM \"User\") AS users, (SELECT COUNT(*) FROM \"StandardSlot\") AS standard_slots, (SELECT COUNT(*) FROM \"PlannerGroup\") AS groups;"
+   ```
+   Compare these values with the table counts printed by the export script. Also test login/session behavior, schedules, groups, and representative shared views before directing users to the new API. Keep the SQLite and PostgreSQL source copies unchanged until the D1 import has been verified.
 
-## Notes
+The D1 migration creates the schema and Worker rate-limit table; the export script imports rows only and does not overwrite schema or migration records.
 
-- Availability uses local wall-clock quarter-hour slots; this starter does not model time zones per user.
-- In personal schedule views, assigned group slots display personal availability and the group's color in separate halves. Group calendar colors indicate shared availability; owner-assigned sessions use the group's color.
-- This is a functional starter UI, not a polished production calendar.
+## Existing account passwords
+
+Existing users have Argon2id hashes. That legacy hashing workload does not fit reliably within Cloudflare Workers Free's 10 ms CPU limit, so the Worker deliberately does not attempt to verify those hashes. The imported schedules, groups, users, and sessions are preserved, but legacy users must set a new password:
+
+- Users with a still-valid imported session can use the in-app password migration prompt. Session continuity requires importing `user_sessions` (the exporter does this) and setting the same `SESSION_SECRET` in Cloudflare.
+- Users with an email address can use **Forgot password** after the Worker has been configured to send through Resend.
+- For an account without an email address and no valid session, the administrator can generate a one-time SQL password update:
+  ```bash
+  npm run db:reset-password -w server -- <username>
+  npx wrangler d1 execute availability-planner --remote --config server/wrangler.jsonc --file=server/d1-password-reset.sql
+  ```
+  Share the chosen password with the account owner through a private channel, then securely delete the ignored SQL file. The generated password is hashed before it is written to SQL.
+
+New and reset passwords are stored as PBKDF2-SHA-256 hashes using 600,000 iterations via Web Crypto. The Worker enforces credentialed CORS, HTTP-only signed sessions, D1-backed rate limits, and the existing API route behavior.
+
+## Useful commands
+
+- `npm run typecheck` — check Worker and generated Prisma Client types
+- `npm run build` — Prisma generation and Wrangler dry-run bundle
+- `npm run db:generate` — regenerate the Prisma Client
+- `npm run db:migrate:local` / `npm run db:migrate:remote` — apply D1 migrations
+- `npm run db:export-sqlite` — export the local SQLite data for import
+- `npm run deploy` — deploy the Worker
+
+For Cloudflare Pages build settings and frontend configuration, see the separate `commontime` repository README.
