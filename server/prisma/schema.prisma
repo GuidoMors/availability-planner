@@ -70,6 +70,7 @@ model PlannerGroup {
   standardSlots GroupStandardSlot[]
   customSlots GroupCustomSlot[]
   biweeklySlots BiweeklySlot[]
+  groupBiweeklySchedules GroupBiweeklySchedule[]
 }
 
 model GroupMember {
@@ -122,6 +123,27 @@ model GroupCustomSlot {
 
   @@unique([userId, groupId, weekStart, day, slot])
   @@index([userId, groupId, weekStart])
+}
+
+model GroupBiweeklySchedule {
+  id      String              @id @default(cuid())
+  groupId String
+  parity  Int
+  group   PlannerGroup        @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  slots   GroupBiweeklySlot[]
+
+  @@unique([groupId, parity])
+  @@index([groupId, parity])
+}
+
+model GroupBiweeklySlot {
+  id         String               @id @default(cuid())
+  scheduleId String
+  day        Int
+  slot       Int
+  schedule   GroupBiweeklySchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  @@unique([scheduleId, day, slot])
 }
 
 model BiweeklySlot {

@@ -7,7 +7,7 @@ A starter full-stack weekly availability app built with React + TypeScript, Expr
 - Docker with Docker Compose (or a local PostgreSQL instance)
 
 ## Run locally
-1. Copy .env.example and docker-compose.yml.example and rename them to .env and docker-compose.yml:
+1. Copy .env.example and docker-compose.yml.example and rename them to .env and docker-compose.yml (you might also need an .env in client)
    Make sure to edit:
    - the secret key in .env
    - the database username and password in docker-compose.yml
@@ -44,14 +44,17 @@ The frontend proxies `/api` requests to Express on port 4000.
 - Session-based authentication; passwords and password hashes are never returned by the API.
 - Password reset token flow with hashed, single-use, expiring tokens.
 - Standard weekly schedule (672 quarter-hour slots).
-- Alternating biweekly schedule snapshots anchored to a selected Monday, alongside one-off week overrides.
+- Alternating biweekly availability overrides anchored to a selected Monday, alongside one-off week overrides. Unchanged slots inherit the current weekly schedule.
 - Custom week overrides stored as changed slots, initialized from the standard schedule.
-- Public-by-username profile schedule view.
+- Biweekly and specific-week changes are highlighted against the regular weekly schedule; click a highlighted slot to restore that slot to its weekly hours.
+- Clear controls remove all every-other-week overrides or the selected specific week's overrides, returning that schedule scope to the regular weekly hours.
+- Authenticated by-username profile schedule view, including the inspected person's group memberships and scheduled group sessions.
 - Groups, membership, and group availability aggregation.
 - Responsive starter UI with standard/custom schedule editor and group color key.
 
 ## Notes
 - Availability is stored in the user's local wall-clock quarter-hour slots. This starter does not model different time zones per user; decide a product-wide timezone policy before deployment.
-- Availability layers: "everyone" availability (green) is the base schedule. Each group also has its own colour and an optional group-only layer; toggling in group mode on the Edit schedule page edits only that layer. A group's shared calendar counts everyone-availability plus that group's own layer and ignores other groups' layers.
-- Group color rules: green = everyone available, red = everyone unavailable, yellow = exactly one unavailable, orange = mixed with two or more unavailable.
+- Availability layers: "everyone" availability (green) is each person's personal schedule. Group assignments are created only from the Groups page; only a group owner can assign recurring, alternating, or one-week times to their group. Group assignments are separate from personal availability, which members can continue to edit. In personal schedule views, the top half of an assigned slot shows personal availability and the bottom half shows the group's color.
+- When inspecting a person's profile, all of their group sessions are shown, including groups the viewer does not belong to.
+- Group calendar colors: green = everyone available, red = two or more unavailable, yellow = exactly one unavailable. Owner-assigned group sessions use the group's color.
 - The UI is a functional starter, not a polished production calendar. It uses simple day/slot controls to keep the project easy to extend.

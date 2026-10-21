@@ -65,7 +65,7 @@ async function getEffectiveWeek(userId, weekStart) {
     const grid = await getStandard(userId);
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { biweeklyAnchorWeekStart: true } });
     if (user?.biweeklyAnchorWeekStart) {
-        const biweekly = await prisma.biweeklySlot.findMany({ where: { userId, parity: weekParity(weekStart, user.biweeklyAnchorWeekStart) } });
+        const biweekly = await prisma.biweeklySlot.findMany({ where: { userId, groupId: null, parity: weekParity(weekStart, user.biweeklyAnchorWeekStart) } });
         if (biweekly.length) {
             for (const row of biweekly)
                 grid[row.day][row.slot] = row.groupId === null && row.available;
@@ -75,6 +75,25 @@ async function getEffectiveWeek(userId, weekStart) {
     if (custom)
         for (const s of custom.slots)
             grid[s.day][s.slot] = s.available;
+    return grid;
+}
+async function getBiweeklyWeek(userId, weekStart) {
+    const grid = await getStandard(userId);
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { biweeklyAnchorWeekStart: true } });
+    if (!user?.biweeklyAnchorWeekStart)
+        return grid;
+    const biweekly = await prisma.biweeklySlot.findMany({ where: { userId, groupId: null, parity: weekParity(weekStart, user.biweeklyAnchorWeekStart) } });
+    if (biweekly.length)
+        for (const slot of biweekly)
+            grid[slot.day][slot.slot] = slot.available;
+    return grid;
+}
+async function getCustomWeek(userId, weekStart) {
+    const grid = await getStandard(userId);
+    const custom = await prisma.customWeek.findUnique({ where: { userId_weekStart: { userId, weekStart: monday(weekStart) } }, include: { slots: true } });
+    if (custom)
+        for (const slot of custom.slots)
+            grid[slot.day][slot.slot] = slot.available;
     return grid;
 }
 function flatten(grid) {
@@ -106,41 +125,140 @@ async function pickGroupColor() {
     return GROUP_COLORS[0];
 }
 const monday = (weekStart) => new Date(`${weekStart}T00:00:00.000Z`);
+const currentWeekStart = () => {
+    const date = new Date();
+    const utc = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+    utc.setUTCDate(utc.getUTCDate() - ((utc.getUTCDay() + 6) % 7));
+    return utc.toISOString().slice(0, 10);
+};
 const participantWhere = (userId) => ({ OR: [{ ownerId: userId }, { members: { some: { userId } } }] });
 async function isParticipant(userId, groupId) {
     return !!(await prisma.plannerGroup.findFirst({ where: { id: groupId, ...participantWhere(userId) }, select: { id: true } }));
 }
 const emptyGrid = () => Array.from({ length: 7 }, () => Array(96).fill(false));
-/** Group-only availability ("available for this group only") per group, effective for one week. */
-async function getGroupLayers(userId, groupIds, weekStart) {
+/** Group assignments are stored on the owner and shared with every participant. */
+async function getGroupLayers(_userId, groupIds, weekStart, includeCustom = true, includeBiweekly = true) {
     const layers = new Map(groupIds.map(id => [id, emptyGrid()]));
     if (!groupIds.length)
         return layers;
-    const standard = await prisma.groupStandardSlot.findMany({ where: { userId, groupId: { in: groupIds } } });
+    const groups = await prisma.plannerGroup.findMany({ where: { id: { in: groupIds } }, select: { id: true, ownerId: true } });
+    const ownerByGroup = new Map(groups.map(group => [group.id, group.ownerId]));
+    const ownerIds = [...new Set(groups.map(group => group.ownerId))];
+    const standard = await prisma.groupStandardSlot.findMany({ where: { userId: { in: ownerIds }, groupId: { in: groupIds } } });
     for (const r of standard)
-        layers.get(r.groupId)[r.day][r.slot] = true;
+        if (ownerByGroup.get(r.groupId) === r.userId)
+            layers.get(r.groupId)[r.day][r.slot] = true;
     if (weekStart) {
-        const user = await prisma.user.findUnique({ where: { id: userId }, select: { biweeklyAnchorWeekStart: true } });
-        if (user?.biweeklyAnchorWeekStart) {
-            const biweekly = await prisma.biweeklySlot.findMany({ where: { userId, parity: weekParity(weekStart, user.biweeklyAnchorWeekStart) } });
-            if (biweekly.length) {
-                for (const grid of layers.values())
-                    for (const row of grid)
-                        row.fill(false);
-                for (const row of biweekly)
-                    if (row.groupId && row.available && layers.has(row.groupId))
-                        layers.get(row.groupId)[row.day][row.slot] = true;
+        if (includeBiweekly) {
+            const owners = await prisma.user.findMany({ where: { id: { in: ownerIds } }, select: { id: true, biweeklyAnchorWeekStart: true } });
+            const anchorByOwner = new Map(owners.map(owner => [owner.id, owner.biweeklyAnchorWeekStart]));
+            const schedules = await prisma.groupBiweeklySchedule.findMany({
+                where: { groupId: { in: groupIds } },
+                include: { slots: true }
+            });
+            for (const group of groups) {
+                const anchor = anchorByOwner.get(group.ownerId);
+                if (!anchor)
+                    continue;
+                const schedule = schedules.find(row => row.groupId === group.id && row.parity === weekParity(weekStart, anchor));
+                if (!schedule)
+                    continue;
+                const grid = layers.get(group.id);
+                for (const row of grid)
+                    row.fill(false);
+                for (const slot of schedule.slots)
+                    grid[slot.day][slot.slot] = true;
             }
         }
-        const custom = await prisma.groupCustomSlot.findMany({ where: { userId, groupId: { in: groupIds }, weekStart: monday(weekStart) } });
-        for (const r of custom)
-            layers.get(r.groupId)[r.day][r.slot] = r.available;
+        if (includeCustom) {
+            const custom = await prisma.groupCustomSlot.findMany({ where: { userId: { in: ownerIds }, groupId: { in: groupIds }, weekStart: monday(weekStart) } });
+            for (const r of custom)
+                if (ownerByGroup.get(r.groupId) === r.userId)
+                    layers.get(r.groupId)[r.day][r.slot] = r.available;
+        }
     }
     return layers;
 }
 async function groupLayerPayload(userId, groups, weekStart) {
     const layers = await getGroupLayers(userId, groups.map(g => g.id), weekStart);
     return groups.map(g => ({ id: g.id, name: g.name, color: g.color, slots: flatten(layers.get(g.id)) }));
+}
+async function getAllGroupAssignmentLayers(groupIds) {
+    const layers = await getGroupLayers("", groupIds);
+    if (!groupIds.length)
+        return layers;
+    const groups = await prisma.plannerGroup.findMany({ where: { id: { in: groupIds } }, select: { id: true, ownerId: true } });
+    const [biweekly, custom] = await Promise.all([
+        prisma.groupBiweeklySchedule.findMany({ where: { groupId: { in: groupIds } }, include: { slots: true } }),
+        prisma.groupCustomSlot.findMany({
+            where: { available: true, weekStart: { gte: monday(currentWeekStart()) }, OR: groups.map(group => ({ groupId: group.id, userId: group.ownerId })) },
+            select: { groupId: true, day: true, slot: true }
+        })
+    ]);
+    for (const schedule of biweekly)
+        for (const slot of schedule.slots)
+            layers.get(schedule.groupId)[slot.day][slot.slot] = true;
+    for (const slot of custom)
+        layers.get(slot.groupId)[slot.day][slot.slot] = true;
+    return layers;
+}
+async function hasGroupAssignmentConflict(groupId, slots, weekStart, ignoredGroupIds = []) {
+    if (!slots.length)
+        return false;
+    const group = await prisma.plannerGroup.findUnique({
+        where: { id: groupId },
+        select: { ownerId: true, members: { select: { userId: true } } }
+    });
+    if (!group)
+        return true;
+    const participants = [...new Set([group.ownerId, ...group.members.map(member => member.userId)])];
+    const slotKeys = new Set(slots.map(slot => `${slot.day}:${slot.slot}`));
+    for (const userId of participants) {
+        const groups = await prisma.plannerGroup.findMany({ where: participantWhere(userId), select: { id: true } });
+        const otherIds = groups.map(item => item.id).filter(id => id !== groupId && !ignoredGroupIds.includes(id));
+        const layers = await getGroupLayers(userId, otherIds, weekStart);
+        for (const layer of layers.values())
+            for (let d = 0; d < 7; d++)
+                for (let s = 0; s < 96; s++) {
+                    if (layer[d][s] && slotKeys.has(`${d}:${s}`))
+                        return true;
+                }
+        if (!weekStart && otherIds.length) {
+            const groupOwners = await prisma.plannerGroup.findMany({ where: { id: { in: otherIds } }, select: { id: true, ownerId: true } });
+            const [biweekly, custom] = await Promise.all([
+                prisma.groupBiweeklySchedule.findMany({ where: { groupId: { in: otherIds } }, include: { slots: true } }),
+                prisma.groupCustomSlot.findMany({
+                    where: { available: true, weekStart: { gte: monday(currentWeekStart()) }, OR: groupOwners.map(other => ({ groupId: other.id, userId: other.ownerId })), AND: [{ OR: slots }] },
+                    select: { day: true, slot: true }
+                })
+            ]);
+            if (custom.length || biweekly.some(schedule => schedule.slots.some(slot => slotKeys.has(`${slot.day}:${slot.slot}`))))
+                return true;
+        }
+    }
+    return false;
+}
+async function hasConflictingGroupAssignments(groups) {
+    const records = await prisma.plannerGroup.findMany({
+        where: { id: { in: groups.map(group => group.groupId) } },
+        select: { id: true, ownerId: true, members: { select: { userId: true } } }
+    });
+    const assignmentByPersonSlot = new Set();
+    for (const assignment of groups) {
+        const record = records.find(group => group.id === assignment.groupId);
+        if (!record)
+            return true;
+        const participants = [...new Set([record.ownerId, ...record.members.map(member => member.userId)])];
+        for (const slot of assignment.slots)
+            if (slot.available)
+                for (const userId of participants) {
+                    const key = `${userId}:${slot.day}:${slot.slot}`;
+                    if (assignmentByPersonSlot.has(key))
+                        return true;
+                    assignmentByPersonSlot.add(key);
+                }
+    }
+    return false;
 }
 async function sendResetEmail(to, url) {
     const host = process.env.SMTP_HOST;
@@ -235,23 +353,33 @@ app.put("/api/schedule/standard", requireAuth, asyncRoute(async (req, res) => {
     if (!parsed.success || parsed.data.length !== 672)
         return res.status(400).json({ error: "Send all 672 weekly slots." });
     const userId = req.session.userId;
-    const assigned = parsed.data.filter(s => s.available).map(({ day, slot }) => ({ day, slot }));
-    await prisma.$transaction([
-        ...parsed.data.map(s => prisma.standardSlot.update({ where: { userId_day_slot: { userId, day: s.day, slot: s.slot } }, data: { available: s.available } })),
-        ...(assigned.length ? [
-            prisma.groupStandardSlot.deleteMany({ where: { userId, OR: assigned } }),
-            prisma.groupCustomSlot.deleteMany({ where: { userId, available: true, OR: assigned } }),
-            prisma.customSlot.deleteMany({ where: { available: true, customWeek: { userId }, OR: assigned } })
-        ] : [])
-    ]);
+    const current = await getStandard(userId);
+    const biweekly = await prisma.biweeklySlot.findMany({ where: { userId, groupId: null }, select: { parity: true, day: true, slot: true, available: true } });
+    const custom = await prisma.customSlot.findMany({ where: { customWeek: { userId } }, select: { id: true, day: true, slot: true, available: true } });
+    const incoming = new Map(parsed.data.map(slot => [`${slot.day}:${slot.slot}`, slot.available]));
+    const biweeklyOverrides = biweekly.filter(row => row.available !== current[row.day][row.slot] && row.available !== incoming.get(`${row.day}:${row.slot}`));
+    const redundantCustomIds = custom.filter(row => row.available === incoming.get(`${row.day}:${row.slot}`)).map(row => row.id);
+    await prisma.$transaction(async (tx) => {
+        await tx.biweeklySlot.deleteMany({ where: { userId, groupId: null } });
+        await Promise.all(parsed.data.map(slot => tx.standardSlot.update({
+            where: { userId_day_slot: { userId, day: slot.day, slot: slot.slot } },
+            data: { available: slot.available }
+        })));
+        if (redundantCustomIds.length)
+            await tx.customSlot.deleteMany({ where: { id: { in: redundantCustomIds } } });
+        if (biweeklyOverrides.length)
+            await tx.biweeklySlot.createMany({
+                data: biweeklyOverrides.map(row => ({ userId, groupId: null, parity: row.parity, day: row.day, slot: row.slot, available: row.available }))
+            });
+    });
     res.json({ slots: flatten(await getStandard(userId)) });
 }));
 app.get("/api/schedule/custom/:weekStart", requireAuth, asyncRoute(async (req, res) => {
-    if (!weekSchema.safeParse(req.params.weekStart).success || !validWeekStart(req.params.weekStart))
-        return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
     const weekStart = req.params.weekStart;
+    if (typeof weekStart !== "string" || !weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
+        return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
     const custom = await prisma.customWeek.findUnique({ where: { userId_weekStart: { userId: req.session.userId, weekStart: new Date(`${weekStart}T00:00:00.000Z`) } }, include: { slots: true } });
-    res.json({ weekStart, hasCustom: !!custom, slots: flatten(await getEffectiveWeek(req.session.userId, weekStart)) });
+    res.json({ weekStart, hasCustom: !!custom, slots: flatten(await getCustomWeek(req.session.userId, weekStart)) });
 }));
 app.put("/api/schedule/custom/:weekStart", requireAuth, asyncRoute(async (req, res) => {
     const weekStart = req.params.weekStart;
@@ -262,35 +390,31 @@ app.put("/api/schedule/custom/:weekStart", requireAuth, asyncRoute(async (req, r
     const parsed = slotsSchema.safeParse(req.body.slots);
     if (!parsed.success || parsed.data.length !== 672)
         return res.status(400).json({ error: "Send all 672 slots." });
+    const userId = req.session.userId;
     const standard = await getStandard(req.session.userId);
     const custom = await prisma.customWeek.upsert({
-        where: { userId_weekStart: { userId: req.session.userId, weekStart: new Date(`${weekStart}T00:00:00.000Z`) } },
-        create: { userId: req.session.userId, weekStart: new Date(`${weekStart}T00:00:00.000Z`) },
+        where: { userId_weekStart: { userId, weekStart: new Date(`${weekStart}T00:00:00.000Z`) } },
+        create: { userId, weekStart: new Date(`${weekStart}T00:00:00.000Z`) },
         update: {}
     });
-    const userId = req.session.userId;
-    const assigned = parsed.data.filter(s => s.available).map(({ day, slot }) => ({ day, slot }));
-    let groupStandard = [];
-    let groupOverrides = [];
-    if (assigned.length)
-        [groupStandard, groupOverrides] = await Promise.all([
-            prisma.groupStandardSlot.findMany({ where: { userId, OR: assigned }, select: { groupId: true, day: true, slot: true } }),
-            prisma.groupCustomSlot.findMany({ where: { userId, weekStart: monday(weekStart), OR: assigned }, select: { groupId: true, day: true, slot: true, available: true } })
-        ]);
-    const groupOverrideKeys = new Set(groupOverrides.map(s => `${s.groupId}:${s.day}:${s.slot}`));
-    const groupOverridesToClear = groupOverrides.filter(s => s.available);
-    const missingGroupOverrides = groupStandard.filter(s => !groupOverrideKeys.has(`${s.groupId}:${s.day}:${s.slot}`));
     await prisma.$transaction([
         prisma.customSlot.deleteMany({ where: { customWeekId: custom.id } }),
-        prisma.customSlot.createMany({ data: parsed.data.filter(s => standard[s.day][s.slot] !== s.available).map(s => ({ customWeekId: custom.id, ...s })) }),
-        ...(groupOverridesToClear.length ? [prisma.groupCustomSlot.updateMany({ where: { userId, weekStart: monday(weekStart), available: true, OR: groupOverridesToClear.map(({ groupId, day, slot }) => ({ groupId, day, slot })) }, data: { available: false } })] : []),
-        ...(missingGroupOverrides.length ? [prisma.groupCustomSlot.createMany({ data: missingGroupOverrides.map(({ groupId, day, slot }) => ({ userId, groupId, weekStart: monday(weekStart), day, slot, available: false })) })] : [])
+        prisma.customSlot.createMany({ data: parsed.data.filter(s => standard[s.day][s.slot] !== s.available).map(s => ({ customWeekId: custom.id, ...s })) })
     ]);
-    res.json({ weekStart, hasCustom: true, slots: flatten(await getEffectiveWeek(req.session.userId, weekStart)) });
+    res.json({ weekStart, hasCustom: true, slots: flatten(await getCustomWeek(userId, weekStart)) });
+}));
+app.delete("/api/schedule/custom/:weekStart", requireAuth, asyncRoute(async (req, res) => {
+    const weekStart = req.params.weekStart;
+    if (typeof weekStart !== "string" || !weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
+        return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
+    const custom = await prisma.customWeek.findUnique({ where: { userId_weekStart: { userId: req.session.userId, weekStart: monday(weekStart) } }, select: { id: true } });
+    if (custom)
+        await prisma.customWeek.delete({ where: { id: custom.id } });
+    res.status(204).end();
 }));
 app.get("/api/schedule/layers/:weekStart", requireAuth, asyncRoute(async (req, res) => {
     const weekStart = req.params.weekStart;
-    if (!weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
+    if (typeof weekStart !== "string" || !weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
         return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
     const groups = await prisma.plannerGroup.findMany({ where: participantWhere(req.session.userId), select: { id: true, name: true, color: true }, orderBy: { createdAt: "asc" } });
     res.json({ everyone: flatten(await getEffectiveWeek(req.session.userId, weekStart)), groups: await groupLayerPayload(req.session.userId, groups, weekStart) });
@@ -301,7 +425,7 @@ app.get("/api/schedule/biweekly/:weekStart", requireAuth, asyncRoute(async (req,
         return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
     const user = await prisma.user.findUnique({ where: { id: req.session.userId }, select: { biweeklyAnchorWeekStart: true } });
     const groups = await prisma.plannerGroup.findMany({ where: participantWhere(req.session.userId), select: { id: true, name: true, color: true }, orderBy: { createdAt: "asc" } });
-    res.json({ weekStart, anchorWeekStart: user?.biweeklyAnchorWeekStart?.toISOString().slice(0, 10) || null, everyone: flatten(await getEffectiveWeek(req.session.userId, weekStart)), groups: await groupLayerPayload(req.session.userId, groups, weekStart) });
+    res.json({ weekStart, anchorWeekStart: user?.biweeklyAnchorWeekStart?.toISOString().slice(0, 10) || null, everyone: flatten(await getBiweeklyWeek(req.session.userId, weekStart)), groups: await groupLayerPayload(req.session.userId, groups, weekStart) });
 }));
 app.put("/api/schedule/biweekly/:weekStart", requireAuth, asyncRoute(async (req, res) => {
     const weekStart = req.params.weekStart;
@@ -314,76 +438,135 @@ app.put("/api/schedule/biweekly/:weekStart", requireAuth, asyncRoute(async (req,
     if (new Set(groupIds).size !== groupIds.length)
         return res.status(400).json({ error: "Each group can appear only once." });
     const userId = req.session.userId;
-    const groups = await prisma.plannerGroup.findMany({ where: { ...participantWhere(userId), id: { in: groupIds } }, select: { id: true } });
+    const groups = await prisma.plannerGroup.findMany({ where: { id: { in: groupIds }, ownerId: userId }, select: { id: true } });
     if (groups.length !== groupIds.length)
-        return res.status(404).json({ error: "A group was not found." });
-    const audiences = new Map();
-    for (const slot of parsed.data.everyone)
-        if (slot.available)
-            audiences.set(`${slot.day}:${slot.slot}`, null);
-    for (const group of parsed.data.groups)
-        for (const slot of group.slots)
-            if (slot.available) {
-                const key = `${slot.day}:${slot.slot}`;
-                if (audiences.has(key))
-                    return res.status(400).json({ error: "Each time slot can be available to everyone or one group only." });
-                audiences.set(key, group.groupId);
-            }
+        return res.status(404).json({ error: "A group was not found or you are not its owner." });
+    if (await hasConflictingGroupAssignments(parsed.data.groups))
+        return res.status(409).json({ error: "A member cannot be assigned to more than one group at the same time." });
     const currentUser = await prisma.user.findUnique({ where: { id: userId }, select: { biweeklyAnchorWeekStart: true } });
     const anchor = currentUser?.biweeklyAnchorWeekStart || monday(weekStart);
     const parity = weekParity(weekStart, anchor);
-    const allSlots = parsed.data.everyone.map(({ day, slot }) => {
-        const groupId = audiences.get(`${day}:${slot}`) ?? null;
-        return { userId, parity, day, slot, available: audiences.has(`${day}:${slot}`), groupId };
+    const standard = await getStandard(userId);
+    for (const group of parsed.data.groups) {
+        const existing = await prisma.groupBiweeklySchedule.findUnique({ where: { groupId_parity: { groupId: group.groupId, parity } }, include: { slots: true } });
+        const previous = new Set(existing?.slots.map(slot => `${slot.day}:${slot.slot}`) || []);
+        const assigned = group.slots.filter(slot => slot.available && !previous.has(`${slot.day}:${slot.slot}`));
+        if (await hasGroupAssignmentConflict(group.groupId, assigned, weekStart, groupIds))
+            return res.status(409).json({ error: "One or more selected times are already reserved for another group." });
+    }
+    await prisma.$transaction(async (tx) => {
+        if (!currentUser?.biweeklyAnchorWeekStart)
+            await tx.user.update({ where: { id: userId }, data: { biweeklyAnchorWeekStart: anchor } });
+        await tx.biweeklySlot.deleteMany({ where: { userId, groupId: null, parity } });
+        const personalOverrides = parsed.data.everyone.filter(slot => slot.available !== standard[slot.day][slot.slot]);
+        if (personalOverrides.length)
+            await tx.biweeklySlot.createMany({ data: personalOverrides.map(({ day, slot, available }) => ({ userId, parity, day, slot, available, groupId: null })) });
+        for (const group of parsed.data.groups) {
+            const schedule = await tx.groupBiweeklySchedule.upsert({
+                where: { groupId_parity: { groupId: group.groupId, parity } },
+                create: { groupId: group.groupId, parity },
+                update: {}
+            });
+            await tx.groupBiweeklySlot.deleteMany({ where: { scheduleId: schedule.id } });
+            await tx.groupBiweeklySlot.createMany({ data: group.slots.filter(slot => slot.available).map(slot => ({ scheduleId: schedule.id, day: slot.day, slot: slot.slot })) });
+        }
     });
-    await prisma.$transaction([
-        ...(!currentUser?.biweeklyAnchorWeekStart ? [prisma.user.update({ where: { id: userId }, data: { biweeklyAnchorWeekStart: anchor } })] : []),
-        prisma.customWeek.deleteMany({ where: { userId, weekStart: monday(weekStart) } }),
-        prisma.groupCustomSlot.deleteMany({ where: { userId, weekStart: monday(weekStart) } }),
-        prisma.biweeklySlot.deleteMany({ where: { userId, parity } }),
-        prisma.biweeklySlot.createMany({ data: allSlots })
-    ]);
     res.json({ weekStart, anchorWeekStart: anchor.toISOString().slice(0, 10), parity });
 }));
+app.delete("/api/schedule/biweekly/:weekStart", requireAuth, asyncRoute(async (req, res) => {
+    const weekStart = req.params.weekStart;
+    if (typeof weekStart !== "string" || !weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
+        return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
+    const userId = req.session.userId;
+    const parsed = z.object({ groupId: z.string().min(1).optional() }).safeParse(req.body);
+    if (!parsed.success)
+        return res.status(400).json({ error: "Invalid schedule target." });
+    if (parsed.data.groupId) {
+        const group = await prisma.plannerGroup.findFirst({ where: { id: parsed.data.groupId, ownerId: userId }, select: { id: true } });
+        if (!group)
+            return res.status(404).json({ error: "Group not found or you are not its owner." });
+        await prisma.$transaction([
+            prisma.groupBiweeklySchedule.deleteMany({ where: { groupId: group.id } }),
+            prisma.biweeklySlot.deleteMany({ where: { userId, groupId: group.id } })
+        ]);
+    }
+    else {
+        await prisma.biweeklySlot.deleteMany({ where: { userId, groupId: null } });
+    }
+    res.status(204).end();
+}));
 app.get("/api/schedule/group/:groupId/standard", requireAuth, asyncRoute(async (req, res) => {
-    if (!(await isParticipant(req.session.userId, req.params.groupId)))
+    const groupId = req.params.groupId;
+    if (typeof groupId !== "string" || !(await isParticipant(req.session.userId, groupId)))
         return res.status(404).json({ error: "Group not found." });
-    const layers = await getGroupLayers(req.session.userId, [req.params.groupId]);
-    res.json({ slots: flatten(layers.get(req.params.groupId)) });
+    const [layers, reservations] = await Promise.all([
+        getGroupLayers(req.session.userId, [groupId]),
+        getAllGroupAssignmentLayers([groupId])
+    ]);
+    res.json({ slots: flatten(layers.get(groupId)), locked: flatten(reservations.get(groupId)) });
 }));
 app.put("/api/schedule/group/:groupId/standard", requireAuth, asyncRoute(async (req, res) => {
     const userId = req.session.userId, groupId = req.params.groupId;
     if (typeof groupId !== "string")
         return res.status(404).json({ error: "Group not found." });
-    if (!(await isParticipant(userId, groupId)))
-        return res.status(404).json({ error: "Group not found." });
+    const group = await prisma.plannerGroup.findFirst({ where: { id: groupId, ownerId: userId }, select: { id: true } });
+    if (!group)
+        return res.status(404).json({ error: "Group not found or you are not its owner." });
     const parsed = slotsSchema.safeParse(req.body.slots);
     if (!parsed.success || parsed.data.length !== 672)
         return res.status(400).json({ error: "Send all 672 weekly slots." });
     const assigned = parsed.data.filter(s => s.available).map(({ day, slot }) => ({ day, slot }));
+    const previous = (await getGroupLayers(userId, [groupId])).get(groupId);
+    const newlyAssigned = assigned.filter(slot => !previous[slot.day][slot.slot]);
+    if (await hasGroupAssignmentConflict(groupId, newlyAssigned) || await hasGroupAssignmentConflict(groupId, newlyAssigned, currentWeekStart()))
+        return res.status(409).json({ error: "One or more selected times are already reserved for another group." });
     await prisma.$transaction([
         prisma.groupStandardSlot.deleteMany({ where: { userId, groupId } }),
-        prisma.groupStandardSlot.createMany({ data: parsed.data.filter(s => s.available).map(s => ({ userId, groupId, day: s.day, slot: s.slot })) }),
-        ...(assigned.length ? [
-            prisma.standardSlot.updateMany({ where: { userId, available: true, OR: assigned }, data: { available: false } }),
-            prisma.groupCustomSlot.deleteMany({ where: { userId, groupId: { not: groupId }, available: true, OR: assigned } }),
-            prisma.customSlot.deleteMany({ where: { available: true, customWeek: { userId }, OR: assigned } })
-        ] : []),
-        ...(assigned.length ? [
-            prisma.groupStandardSlot.deleteMany({ where: { userId, groupId: { not: groupId }, OR: assigned } })
-        ] : [])
+        prisma.groupStandardSlot.createMany({ data: assigned.map(({ day, slot }) => ({ userId, groupId, day, slot })) })
     ]);
     const layers = await getGroupLayers(userId, [groupId]);
     res.json({ slots: flatten(layers.get(groupId)) });
 }));
-app.get("/api/schedule/group/:groupId/custom/:weekStart", requireAuth, asyncRoute(async (req, res) => {
-    const weekStart = req.params.weekStart;
-    if (!weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
-        return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
-    if (!(await isParticipant(req.session.userId, req.params.groupId)))
+app.put("/api/schedule/group/:groupId/biweekly/:weekStart", requireAuth, asyncRoute(async (req, res) => {
+    const userId = req.session.userId, groupId = req.params.groupId, weekStart = req.params.weekStart;
+    if (typeof groupId !== "string")
         return res.status(404).json({ error: "Group not found." });
-    const layers = await getGroupLayers(req.session.userId, [req.params.groupId], weekStart);
-    res.json({ weekStart, slots: flatten(layers.get(req.params.groupId)) });
+    if (typeof weekStart !== "string" || !weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
+        return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
+    const group = await prisma.plannerGroup.findFirst({ where: { id: groupId, ownerId: userId }, select: { id: true } });
+    if (!group)
+        return res.status(404).json({ error: "Group not found or you are not its owner." });
+    const parsed = slotsSchema.safeParse(req.body.slots);
+    if (!parsed.success || parsed.data.length !== 672)
+        return res.status(400).json({ error: "Send all 672 alternating-week slots." });
+    const current = (await getGroupLayers(userId, [groupId], weekStart, false, true)).get(groupId);
+    const assigned = parsed.data.filter(slot => slot.available && !current[slot.day][slot.slot]);
+    if (await hasGroupAssignmentConflict(groupId, assigned, weekStart))
+        return res.status(409).json({ error: "One or more selected times are already reserved for another group." });
+    const owner = await prisma.user.findUnique({ where: { id: userId }, select: { biweeklyAnchorWeekStart: true } });
+    const anchor = owner?.biweeklyAnchorWeekStart || monday(weekStart);
+    const parity = weekParity(weekStart, anchor);
+    await prisma.$transaction(async (tx) => {
+        if (!owner?.biweeklyAnchorWeekStart)
+            await tx.user.update({ where: { id: userId }, data: { biweeklyAnchorWeekStart: anchor } });
+        const schedule = await tx.groupBiweeklySchedule.upsert({
+            where: { groupId_parity: { groupId, parity } },
+            create: { groupId, parity },
+            update: {}
+        });
+        await tx.groupBiweeklySlot.deleteMany({ where: { scheduleId: schedule.id } });
+        await tx.groupBiweeklySlot.createMany({ data: parsed.data.filter(slot => slot.available).map(slot => ({ scheduleId: schedule.id, day: slot.day, slot: slot.slot })) });
+    });
+    res.status(204).end();
+}));
+app.get("/api/schedule/group/:groupId/custom/:weekStart", requireAuth, asyncRoute(async (req, res) => {
+    const groupId = req.params.groupId, weekStart = req.params.weekStart;
+    if (typeof weekStart !== "string" || !weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
+        return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
+    if (typeof groupId !== "string" || !(await isParticipant(req.session.userId, groupId)))
+        return res.status(404).json({ error: "Group not found." });
+    const layers = await getGroupLayers(req.session.userId, [groupId], weekStart, true, false);
+    res.json({ weekStart, slots: flatten(layers.get(groupId)) });
 }));
 app.put("/api/schedule/group/:groupId/custom/:weekStart", requireAuth, asyncRoute(async (req, res) => {
     const userId = req.session.userId, groupId = req.params.groupId, weekStart = req.params.weekStart;
@@ -393,60 +576,50 @@ app.put("/api/schedule/group/:groupId/custom/:weekStart", requireAuth, asyncRout
         return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
     if (!weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
         return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
-    if (!(await isParticipant(userId, groupId)))
-        return res.status(404).json({ error: "Group not found." });
+    const group = await prisma.plannerGroup.findFirst({ where: { id: groupId, ownerId: userId }, select: { id: true } });
+    if (!group)
+        return res.status(404).json({ error: "Group not found or you are not its owner." });
     const parsed = slotsSchema.safeParse(req.body.slots);
     if (!parsed.success || parsed.data.length !== 672)
         return res.status(400).json({ error: "Send all 672 slots." });
-    const standard = (await getGroupLayers(userId, [groupId])).get(groupId);
+    const standard = (await getGroupLayers(userId, [groupId], weekStart, false, false)).get(groupId);
+    const current = (await getGroupLayers(userId, [groupId], weekStart, true, false)).get(groupId);
     const assigned = parsed.data.filter(s => s.available).map(({ day, slot }) => ({ day, slot }));
-    const otherGroupIds = (await prisma.plannerGroup.findMany({ where: participantWhere(userId), select: { id: true } })).map(g => g.id).filter(id => id !== groupId);
-    const otherWhere = { userId, groupId: { in: otherGroupIds }, weekStart: monday(weekStart), OR: assigned };
-    const customWeek = await prisma.customWeek.upsert({
-        where: { userId_weekStart: { userId, weekStart: monday(weekStart) } },
-        create: { userId, weekStart: monday(weekStart) },
-        update: {}
-    });
-    let otherStandard = [];
-    let otherOverrides = [];
-    let publicStandard = [];
-    let publicOverrides = [];
-    if (assigned.length)
-        [otherStandard, otherOverrides, publicStandard, publicOverrides] = await Promise.all([
-            otherGroupIds.length ? prisma.groupStandardSlot.findMany({ where: { userId, groupId: { in: otherGroupIds }, OR: assigned }, select: { groupId: true, day: true, slot: true } }) : Promise.resolve([]),
-            otherGroupIds.length ? prisma.groupCustomSlot.findMany({ where: otherWhere, select: { groupId: true, day: true, slot: true, available: true } }) : Promise.resolve([]),
-            prisma.standardSlot.findMany({ where: { userId, available: true, OR: assigned }, select: { day: true, slot: true } }),
-            prisma.customSlot.findMany({ where: { customWeekId: customWeek.id, OR: assigned }, select: { day: true, slot: true, available: true } })
-        ]);
-    const overrideKeys = new Set(otherOverrides.map(s => `${s.groupId}:${s.day}:${s.slot}`));
-    const missingOverrides = otherStandard.filter(s => !overrideKeys.has(`${s.groupId}:${s.day}:${s.slot}`));
-    const activeOverrides = otherOverrides.filter(s => s.available);
-    const publicOverrideKeys = new Set(publicOverrides.map(s => `${s.day}:${s.slot}`));
-    const publicOverridesToClear = publicOverrides.filter(s => s.available);
-    const missingPublicOverrides = publicStandard.filter(s => !publicOverrideKeys.has(`${s.day}:${s.slot}`));
+    const newlyAssigned = assigned.filter(slot => !current[slot.day][slot.slot]);
+    if (await hasGroupAssignmentConflict(groupId, newlyAssigned, weekStart))
+        return res.status(409).json({ error: "One or more selected times are already reserved for another group." });
     await prisma.$transaction([
         prisma.groupCustomSlot.deleteMany({ where: { userId, groupId, weekStart: monday(weekStart) } }),
-        prisma.groupCustomSlot.createMany({ data: parsed.data.filter(s => standard[s.day][s.slot] !== s.available).map(s => ({ userId, groupId, weekStart: monday(weekStart), day: s.day, slot: s.slot, available: s.available })) }),
-        ...(activeOverrides.length ? [prisma.groupCustomSlot.updateMany({ where: { userId, weekStart: monday(weekStart), available: true, OR: activeOverrides.map(({ groupId: otherId, day, slot }) => ({ groupId: otherId, day, slot })) }, data: { available: false } })] : []),
-        ...(missingOverrides.length ? [prisma.groupCustomSlot.createMany({ data: missingOverrides.map(({ groupId: otherId, day, slot }) => ({ userId, groupId: otherId, weekStart: monday(weekStart), day, slot, available: false })) })] : []),
-        ...(publicOverridesToClear.length ? [prisma.customSlot.updateMany({ where: { customWeekId: customWeek.id, available: true, OR: publicOverridesToClear.map(({ day, slot }) => ({ day, slot })) }, data: { available: false } })] : []),
-        ...(missingPublicOverrides.length ? [prisma.customSlot.createMany({ data: missingPublicOverrides.map(({ day, slot }) => ({ customWeekId: customWeek.id, day, slot, available: false })) })] : [])
+        prisma.groupCustomSlot.createMany({ data: parsed.data.filter(s => standard[s.day][s.slot] !== s.available).map(s => ({ userId, groupId, weekStart: monday(weekStart), day: s.day, slot: s.slot, available: s.available })) })
     ]);
-    const layers = await getGroupLayers(userId, [groupId], weekStart);
+    const layers = await getGroupLayers(userId, [groupId], weekStart, true, false);
     res.json({ weekStart, slots: flatten(layers.get(groupId)) });
 }));
+app.delete("/api/schedule/group/:groupId/custom/:weekStart", requireAuth, asyncRoute(async (req, res) => {
+    const userId = req.session.userId, groupId = req.params.groupId, weekStart = req.params.weekStart;
+    if (typeof groupId !== "string")
+        return res.status(404).json({ error: "Group not found." });
+    if (typeof weekStart !== "string" || !weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
+        return res.status(400).json({ error: "weekStart must be a Monday in YYYY-MM-DD format." });
+    const group = await prisma.plannerGroup.findFirst({ where: { id: groupId, ownerId: userId }, select: { id: true } });
+    if (!group)
+        return res.status(404).json({ error: "Group not found or you are not its owner." });
+    await prisma.groupCustomSlot.deleteMany({ where: { userId, groupId, weekStart: monday(weekStart) } });
+    res.status(204).end();
+}));
 app.get("/api/users/:username/schedule/:weekStart", requireAuth, asyncRoute(async (req, res) => {
-    const weekStart = req.params.weekStart;
-    if (!weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
+    const weekStart = req.params.weekStart, username = req.params.username;
+    if (typeof weekStart !== "string" || !weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
         return res.status(400).json({ error: "weekStart must be a Monday." });
-    const user = await prisma.user.findUnique({ where: { username: req.params.username.toLowerCase() }, select: { id: true, username: true } });
+    if (typeof username !== "string")
+        return res.status(400).json({ error: "Enter a valid username." });
+    const user = await prisma.user.findUnique({ where: { username: username.toLowerCase() }, select: { id: true, username: true } });
     if (!user)
         return res.status(404).json({ error: "User not found." });
     const standard = await getStandard(user.id);
     const custom = await prisma.customWeek.findUnique({ where: { userId_weekStart: { userId: user.id, weekStart: new Date(`${weekStart}T00:00:00.000Z`) } } });
-    // Only reveal group-only availability for groups the viewer and the profile owner both belong to.
-    const shared = await prisma.plannerGroup.findMany({ where: { AND: [participantWhere(req.session.userId), participantWhere(user.id)] }, select: { id: true, name: true, color: true }, orderBy: { createdAt: "asc" } });
-    res.json({ user: { username: user.username }, standard: flatten(standard), custom: flatten(await getEffectiveWeek(user.id, weekStart)), hasCustom: !!custom, groups: await groupLayerPayload(user.id, shared, weekStart) });
+    const groups = await prisma.plannerGroup.findMany({ where: participantWhere(user.id), select: { id: true, name: true, color: true }, orderBy: { createdAt: "asc" } });
+    res.json({ user: { username: user.username }, standard: flatten(standard), custom: flatten(await getEffectiveWeek(user.id, weekStart)), hasCustom: !!custom, groups: await groupLayerPayload(user.id, groups, weekStart) });
 }));
 app.get("/api/groups", requireAuth, asyncRoute(async (req, res) => {
     const groups = await prisma.plannerGroup.findMany({ where: { OR: [{ ownerId: req.session.userId }, { members: { some: { userId: req.session.userId } } }] }, include: { members: { include: { user: { select: { id: true, username: true } } } }, owner: { select: { id: true, username: true } } }, orderBy: { createdAt: "desc" } });
@@ -483,10 +656,13 @@ app.patch("/api/groups/:id", requireAuth, asyncRoute(async (req, res) => {
     res.json({ group: { id: updated.id, name: updated.name, color: updated.color } });
 }));
 app.post("/api/groups/:id/members", requireAuth, asyncRoute(async (req, res) => {
+    const groupId = req.params.id;
+    if (typeof groupId !== "string")
+        return res.status(404).json({ error: "Group not found or you are not its owner." });
     const parsed = z.object({ username: usernameSchema }).safeParse(req.body);
     if (!parsed.success)
         return res.status(400).json({ error: "Enter a valid username." });
-    const group = await prisma.plannerGroup.findUnique({ where: { id: req.params.id } });
+    const group = await prisma.plannerGroup.findUnique({ where: { id: groupId } });
     if (!group || group.ownerId !== req.session.userId)
         return res.status(404).json({ error: "Group not found or you are not its owner." });
     const user = await prisma.user.findUnique({ where: { username: parsed.data.username.toLowerCase() } });
@@ -496,44 +672,66 @@ app.post("/api/groups/:id/members", requireAuth, asyncRoute(async (req, res) => 
     res.status(201).json({ message: "Member added." });
 }));
 app.delete("/api/groups/:id/members/:userId", requireAuth, asyncRoute(async (req, res) => {
-    const group = await prisma.plannerGroup.findUnique({ where: { id: req.params.id } });
-    if (!group || group.ownerId !== req.session.userId)
-        return res.status(404).json({ error: "Group not found or you are not its owner." });
+    const groupId = req.params.id, memberId = req.params.userId;
+    if (typeof groupId !== "string" || typeof memberId !== "string")
+        return res.status(404).json({ error: "Group not found or you are not allowed to remove this member." });
+    const group = await prisma.plannerGroup.findUnique({ where: { id: groupId } });
+    const isOwner = group?.ownerId === req.session.userId;
+    const leavingSelf = memberId === req.session.userId;
+    if (!group || (!isOwner && !leavingSelf))
+        return res.status(404).json({ error: "Group not found or you are not allowed to remove this member." });
     await prisma.$transaction([
-        prisma.groupMember.deleteMany({ where: { groupId: group.id, userId: req.params.userId } }),
-        prisma.groupStandardSlot.deleteMany({ where: { groupId: group.id, userId: req.params.userId } }),
-        prisma.groupCustomSlot.deleteMany({ where: { groupId: group.id, userId: req.params.userId } })
+        prisma.groupMember.deleteMany({ where: { groupId: group.id, userId: memberId } }),
+        prisma.groupStandardSlot.deleteMany({ where: { groupId: group.id, userId: memberId } }),
+        prisma.groupCustomSlot.deleteMany({ where: { groupId: group.id, userId: memberId } })
     ]);
     res.status(204).end();
 }));
 app.get("/api/groups/:id/schedule/:weekStart", requireAuth, asyncRoute(async (req, res) => {
-    const weekStart = req.params.weekStart;
-    if (!weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
+    const groupId = req.params.id, weekStart = req.params.weekStart;
+    if (typeof groupId !== "string")
+        return res.status(404).json({ error: "Group not found." });
+    if (typeof weekStart !== "string" || !weekSchema.safeParse(weekStart).success || !validWeekStart(weekStart))
         return res.status(400).json({ error: "weekStart must be a Monday." });
     const group = await prisma.plannerGroup.findFirst({
-        where: { id: req.params.id, OR: [{ ownerId: req.session.userId }, { members: { some: { userId: req.session.userId } } }] },
+        where: { id: groupId, OR: [{ ownerId: req.session.userId }, { members: { some: { userId: req.session.userId } } }] },
         include: { owner: { select: { id: true, username: true } }, members: { include: { user: { select: { id: true, username: true } } } } }
     });
     if (!group)
         return res.status(404).json({ error: "Group not found." });
     const users = [group.owner, ...group.members.map(m => m.user)].filter((u, i, a) => a.findIndex(v => v.id === u.id) === i);
-    // Only "everyone" availability plus this group's own group-only availability counts; other groups' slots are ignored.
+    const userIds = users.map(user => user.id);
+    const participantGroups = await prisma.plannerGroup.findMany({
+        where: { OR: [{ ownerId: { in: userIds } }, { members: { some: { userId: { in: userIds } } } }] },
+        select: { id: true, ownerId: true, members: { select: { userId: true } } }
+    });
     const grids = await Promise.all(users.map(async (u) => {
         const everyone = await getEffectiveWeek(u.id, weekStart);
         const grid = everyone.map(row => [...row]);
-        const own = (await getGroupLayers(u.id, [group.id], weekStart)).get(group.id);
+        const groupIds = participantGroups
+            .filter(participantGroup => participantGroup.ownerId === u.id || participantGroup.members.some(member => member.userId === u.id))
+            .map(participantGroup => participantGroup.id);
+        const layers = await getGroupLayers(u.id, groupIds, weekStart);
+        const selectedGroupLayer = layers.get(group.id) ?? emptyGrid();
+        for (const [assignedGroupId, layer] of layers)
+            if (assignedGroupId !== group.id) {
+                for (let d = 0; d < 7; d++)
+                    for (let s = 0; s < 96; s++)
+                        if (layer[d][s])
+                            grid[d][s] = false;
+            }
         for (let d = 0; d < 7; d++)
             for (let s = 0; s < 96; s++)
-                if (own[d][s])
+                if (selectedGroupLayer[d][s])
                     grid[d][s] = true;
-        return { username: u.username, grid, groupOnly: own, isOwner: u.id === group.ownerId };
+        return { username: u.username, grid, groupOnly: selectedGroupLayer };
     }));
     const slots = Array.from({ length: 672 }, (_, i) => {
         const day = Math.floor(i / 96), slot = i % 96;
         const unavailable = grids.filter(g => !g.grid[day][slot]).map(g => g.username);
         const available = grids.length - unavailable.length;
-        const status = available === grids.length ? "green" : unavailable.length === grids.length ? "red" : unavailable.length === 1 ? "yellow" : "orange";
-        const groupOnly = grids.some(g => g.isOwner && g.groupOnly[day][slot]);
+        const status = available === grids.length ? "green" : unavailable.length === 1 ? "yellow" : "red";
+        const groupOnly = grids.some(g => g.groupOnly[day][slot]);
         return { day, slot, status, unavailable, groupOnly };
     });
     res.json({ group: { id: group.id, name: group.name, color: group.color }, members: grids.map(g => g.username), slots });
