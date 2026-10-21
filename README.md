@@ -1,13 +1,13 @@
-# Availability Planner
+# Availability Planner API
 
-A starter full-stack weekly availability app built with React + TypeScript, Express, Prisma, and PostgreSQL.
+The server-side repository for the Availability Planner API, built with Express, Prisma, and PostgreSQL. The Cloudflare Pages client is maintained separately in the sibling `availability-planner-client` folder.
 
 ## Requirements
 - Node.js 20+
 - Docker with Docker Compose (or a local PostgreSQL instance)
 
 ## Run locally
-1. Copy .env.example and docker-compose.yml.example and rename them to .env and docker-compose.yml (you might also need an .env in client)
+1. Copy `.env.example` and `docker-compose.yml.example` and rename them to `.env` and `docker-compose.yml`.
    Make sure to edit:
    - the secret key in .env
    - the database username and password in docker-compose.yml
@@ -24,22 +24,23 @@ A starter full-stack weekly availability app built with React + TypeScript, Expr
    ```bash
    npm run db:migrate
    ```
-5. Start frontend and backend:
+5. Start the API:
    ```bash
    npm run dev
    ```
-6. Open http://localhost:5173
 
-The frontend proxies `/api` requests to Express on port 4000.
+The API listens on port 4000. For local full-stack development, run the client from the sibling `availability-planner-client` folder; its Vite dev server proxies `/api` requests to this API.
 
 ## Important configuration
 - Set `SESSION_SECRET` to a long random secret before deployment.
-- Configure `APP_URL` and SMTP settings before enabling email delivery.
+- Set `APP_URL` to the client origin and `CORS_ORIGINS` to the comma-separated client origins allowed to make credentialed API requests.
+- Configure SMTP settings before enabling email delivery.
+- A Cloudflare Pages site calling `localhost` reaches the backend on the computer running that visitor's browser, not a backend on another machine. For a deployed Pages client, set `VITE_API_BASE_URL` to the local API's browser-reachable HTTPS URL, allow the Pages origin in `CORS_ORIGINS`, and set `SESSION_COOKIE_SAME_SITE=none` and `SESSION_COOKIE_SECURE=true`. Because cross-site cookies require HTTPS, expose the local API through an HTTPS reverse proxy; a plain HTTP API on port 4000 cannot provide authenticated cross-site sessions.
 - In development, password-reset links are logged to the API console if SMTP is not configured. Never use console delivery in production.
 - Use HTTPS in production. Session cookies are HTTP-only and secure in production.
 - Configure a real email provider, monitoring, backups, and rate limits at the reverse proxy before public launch.
 
-## Included
+## API features
 - Username/email/password registration and username/password login using Argon2id password hashes.
 - Session-based authentication; passwords and password hashes are never returned by the API.
 - Password reset token flow with hashed, single-use, expiring tokens.

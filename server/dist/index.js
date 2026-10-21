@@ -15,11 +15,17 @@ const prisma = new PrismaClient();
 const port = Number(process.env.PORT || 4000);
 const appUrl = process.env.APP_URL || "http://localhost:5173";
 const isProduction = process.env.NODE_ENV === "production";
+const corsOrigins = new Set((process.env.CORS_ORIGINS || appUrl).split(",").map(origin => origin.trim()).filter(Boolean));
+const sessionCookieSameSite = z.enum(["lax", "strict", "none"]).parse(process.env.SESSION_COOKIE_SAME_SITE || "lax");
+const sessionCookieSecure = isProduction || process.env.SESSION_COOKIE_SECURE === "true";
+if (sessionCookieSameSite === "none" && !sessionCookieSecure) {
+    throw new Error("SESSION_COOKIE_SECURE=true is required when SESSION_COOKIE_SAME_SITE=none.");
+}
 if (isProduction && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
     throw new Error("SESSION_SECRET must be at least 32 characters in production.");
 }
 app.set("trust proxy", 1);
-app.use(cors({ origin: appUrl, credentials: true }));
+app.use(cors({ origin: (origin, callback) => callback(null, !origin || corsOrigins.has(origin)), credentials: true }));
 app.use(express.json({ limit: "100kb" }));
 const PgStore = connectPgSimple(session);
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -31,8 +37,8 @@ app.use(session({
     saveUninitialized: false,
     cookie: {
         httpOnly: true,
-        secure: isProduction,
-        sameSite: "lax",
+        secure: sessionCookieSecure,
+        sameSite: sessionCookieSameSite,
         maxAge: 1000 * 60 * 60 * 24 * 7
     }
 }));
