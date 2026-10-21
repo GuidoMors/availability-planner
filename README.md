@@ -1,61 +1,64 @@
 # Availability Planner API
 
-The server-side repository for the Availability Planner API, built with Express, Prisma, and PostgreSQL. The Cloudflare Pages client is maintained separately in the sibling `availability-planner-client` folder.
+The API is an Express and Prisma application using SQLite for application data and server-side sessions. The React/Vite client is maintained in the sibling `commontime` folder.
 
 ## Requirements
+
 - Node.js 20+
-- Docker with Docker Compose (or a local PostgreSQL instance)
 
 ## Run locally
-1. Copy `.env.example` and `docker-compose.yml.example` and rename them to `.env` and `docker-compose.yml`.
-   Make sure to edit:
-   - the secret key in .env
-   - the database username and password in docker-compose.yml
-   - set the databae username and password correct in .env
-2. Start PostgreSQL:
-   ```bash
-   docker compose up -d db
-   ```
-3. Install dependencies:
+
+From this repository root:
+
+1. Copy `.env.example` to `.env`. Set `SESSION_SECRET` to a unique random value; keep the SQLite `DATABASE_URL` as provided unless you want the database in another location.
+2. Install dependencies:
    ```bash
    npm install
    ```
-4. Create the database schema and generate Prisma Client:
+3. Create/update the SQLite schema and generate Prisma Client:
    ```bash
    npm run db:migrate
    ```
-5. Start the API:
+4. Start the API:
    ```bash
    npm run dev
    ```
 
-The API listens on port 4000. For local full-stack development, run the client from the sibling `availability-planner-client` folder; its Vite dev server proxies `/api` requests to this API.
+The API listens on `http://localhost:4000`. The database file is `server/availability.db`; the SQLite session store is in that same file. To run the client locally, start it from `commontime`; its Vite server proxies `/api` requests to this API.
 
-## Important configuration
-- Set `SESSION_SECRET` to a long random secret before deployment.
-- Set `APP_URL` to the client origin and `CORS_ORIGINS` to the comma-separated client origins allowed to make credentialed API requests.
-- Configure SMTP settings before enabling email delivery.
-- A Cloudflare Pages site calling `localhost` reaches the backend on the computer running that visitor's browser, not a backend on another machine. For a deployed Pages client, set `VITE_API_BASE_URL` to the local API's browser-reachable HTTPS URL, allow the Pages origin in `CORS_ORIGINS`, and set `SESSION_COOKIE_SAME_SITE=none` and `SESSION_COOKIE_SECURE=true`. Because cross-site cookies require HTTPS, expose the local API through an HTTPS reverse proxy; a plain HTTP API on port 4000 cannot provide authenticated cross-site sessions.
-- In development, password-reset links are logged to the API console if SMTP is not configured. Never use console delivery in production.
+## Database and deployments
+
+- SQLite does not need a separate database server, Docker, or database hosting. The API process reads and writes the database file directly.
+- Back up `server/availability.db` regularly and verify you can restore it.
+- The API host must provide persistent storage at the path specified by `DATABASE_URL`. Ephemeral storage can lose the database on restart or redeploy. Run a single API instance because SQLite is a local file, not a shared multi-instance database.
+- The earlier PostgreSQL migration history is archived in `server/prisma/migrations-postgresql`; use the SQLite migrations in `server/prisma/migrations` for new SQLite databases.
+- The PostgreSQL database previously used in this development workspace was copied into its local SQLite database. This database file is ignored by Git and is not included in a clone or deployment. The PostgreSQL source was left unchanged; the two databases do not stay in sync. Back up and verify your SQLite file before retiring the old PostgreSQL copy.
+- Existing PostgreSQL data is not automatically imported by the SQLite migrations. For a different database or deployment, use a deliberate data migration and verify it before switching traffic.
+
+Use `npm run db:deploy` to apply already-created migrations in a production environment. `npm run db:migrate` is for local development and can create migrations.
+
+## Configuration
+
+- `DATABASE_URL`: SQLite file URL; the example points to `server/availability.db`.
+- `SESSION_SECRET`: use a long, unique secret of at least 32 characters in production.
+- `APP_URL`: client origin used by the API, defaulting to `http://localhost:5173`.
+- `CORS_ORIGINS`: comma-separated client origins allowed to make credentialed API requests.
+- For a deployed Cloudflare Pages client, set its `VITE_API_BASE_URL` to the API's HTTPS origin. Set `APP_URL` and `CORS_ORIGINS` to the exact Pages origin and use `SESSION_COOKIE_SAME_SITE=none` and `SESSION_COOKIE_SECURE=true`. A Pages site using `localhost` reaches the visitor's computer, not your backend.
+- Configure SMTP settings to send password reset emails. Without SMTP, reset links are only logged in development; never use console delivery in production.
 - Use HTTPS in production. Session cookies are HTTP-only and secure in production.
-- Configure a real email provider, monitoring, backups, and rate limits at the reverse proxy before public launch.
 
 ## API features
-- Username/email/password registration and username/password login using Argon2id password hashes.
+
+- Username/password registration and login using Argon2id password hashes. Email is optional and only needed for email-based password recovery; accounts without an email cannot recover a forgotten password.
 - Session-based authentication; passwords and password hashes are never returned by the API.
-- Password reset token flow with hashed, single-use, expiring tokens.
-- Standard weekly schedule (672 quarter-hour slots).
-- Alternating biweekly availability overrides anchored to a selected Monday, alongside one-off week overrides. Unchanged slots inherit the current weekly schedule.
-- Custom week overrides stored as changed slots, initialized from the standard schedule.
-- Biweekly and specific-week changes are highlighted against the regular weekly schedule; click a highlighted slot to restore that slot to its weekly hours.
-- Clear controls remove all every-other-week overrides or the selected specific week's overrides, returning that schedule scope to the regular weekly hours.
-- Authenticated by-username profile schedule view, including the inspected person's group memberships and scheduled group sessions.
-- Groups, membership, and group availability aggregation.
-- Responsive starter UI with standard/custom schedule editor and group color key.
+- Password reset tokens are hashed, single-use, and expire after 30 minutes.
+- Standard weekly availability with 672 quarter-hour slots.
+- Alternating biweekly overrides anchored to a selected Monday, plus one-off week overrides. Unchanged slots inherit the regular weekly schedule.
+- Group memberships, shared availability, and group-owner-assigned schedules.
+- Authenticated by-username profile schedules, including inspected users' group memberships and scheduled group sessions.
 
 ## Notes
-- Availability is stored in the user's local wall-clock quarter-hour slots. This starter does not model different time zones per user; decide a product-wide timezone policy before deployment.
-- Availability layers: "everyone" availability (green) is each person's personal schedule. Group assignments are created only from the Groups page; only a group owner can assign recurring, alternating, or one-week times to their group. Group assignments are separate from personal availability, which members can continue to edit. In personal schedule views, the top half of an assigned slot shows personal availability and the bottom half shows the group's color.
-- When inspecting a person's profile, all of their group sessions are shown, including groups the viewer does not belong to.
-- Group calendar colors: green = everyone available, red = two or more unavailable, yellow = exactly one unavailable. Owner-assigned group sessions use the group's color.
-- The UI is a functional starter, not a polished production calendar. It uses simple day/slot controls to keep the project easy to extend.
+
+- Availability uses local wall-clock quarter-hour slots; this starter does not model time zones per user.
+- In personal schedule views, assigned group slots display personal availability and the group's color in separate halves. Group calendar colors indicate shared availability; owner-assigned sessions use the group's color.
+- This is a functional starter UI, not a polished production calendar.

@@ -1,8 +1,6 @@
 import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
-import session from "express-session";
-import connectPgSimple from "connect-pg-simple";
-import { Pool } from "pg";
+import session, { Store } from "express-session";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import argon2 from "argon2";
@@ -13,6 +11,58 @@ import { z } from "zod";
 
 const app = express();
 const prisma = new PrismaClient();
+class PrismaSessionStore extends Store {
+  get(sid: string, callback: (err: any, session?: session.SessionData | null) => void) {
+    void prisma.sessionStore.findUnique({ where: { sid } }).then(async stored => {
+      if (!stored || stored.expire <= new Date()) {
+        if (stored) await prisma.sessionStore.deleteMany({ where: { sid } });
+        callback(null, null);
+        return;
+      }
+      let data: unknown;
+      try {
+        data = JSON.parse(stored.sess);
+      } catch (error) {
+        callback(error);
+        return;
+      }
+      if (typeof data !== "object" || data === null || Array.isArray(data)) {
+        callback(new Error("Stored session data is invalid."));
+        return;
+      }
+      callback(null, data as session.SessionData);
+    }).catch(callback);
+  }
+
+  set(sid: string, data: session.SessionData, callback?: (err?: any) => void) {
+    let serialized: string | undefined;
+    try {
+      serialized = JSON.stringify(data);
+    } catch (error) {
+      callback?.(error);
+      return;
+    }
+    if (!serialized) {
+      callback?.(new Error("Session data could not be serialized."));
+      return;
+    }
+    const expire = data.cookie.expires ?? new Date(Date.now() + (data.cookie.originalMaxAge ?? 0));
+    void prisma.sessionStore.upsert({
+      where: { sid },
+      create: { sid, sess: serialized, expire },
+      update: { sess: serialized, expire }
+    }).then(() => callback?.()).catch(error => callback?.(error));
+  }
+
+  destroy(sid: string, callback?: (err?: any) => void) {
+    void prisma.sessionStore.deleteMany({ where: { sid } }).then(() => callback?.()).catch(error => callback?.(error));
+  }
+
+  touch(sid: string, data: session.SessionData, callback?: (err?: Error) => void) {
+    const expire = data.cookie.expires ?? new Date(Date.now() + (data.cookie.originalMaxAge ?? 0));
+    void prisma.sessionStore.updateMany({ where: { sid }, data: { expire } }).then(() => callback?.()).catch(error => callback?.(error));
+  }
+}
 const port = Number(process.env.PORT || 4000);
 const appUrl = process.env.APP_URL || "http://localhost:5173";
 const isProduction = process.env.NODE_ENV === "production";
@@ -29,10 +79,8 @@ if (isProduction && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.l
 app.set("trust proxy", 1);
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || corsOrigins.has(origin)), credentials: true }));
 app.use(express.json({ limit: "100kb" }));
-const PgStore = connectPgSimple(session);
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 app.use(session({
-  store: new PgStore({ pool, tableName: "user_sessions", createTableIfMissing: true }),
+  store: new PrismaSessionStore(),
   name: "availability.sid",
   secret: process.env.SESSION_SECRET || "development-only-change-this-secret-32chars",
   resave: false,
@@ -255,14 +303,12 @@ async function sendResetEmail(to: string, url: string) {
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.post("/api/auth/register", authLimiter, asyncRoute(async (req, res) => {
-  const schema = z.object({ username: usernameSchema, email: z.string().trim().email().max(254), password: z.string().min(12).max(128) });
+  const schema = z.object({ username: usernameSchema, password: z.string().min(12).max(128) });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Username must be 3–24 letters/numbers/underscores; password must be 12–128 characters." });
   const username = parsed.data.username.toLowerCase();
-  const email = parsed.data.email.toLowerCase();
   if (await prisma.user.findUnique({ where: { username } })) return res.status(409).json({ error: "Username is already taken." });
-  if (await prisma.user.findUnique({ where: { email } })) return res.status(409).json({ error: "Email is already registered." });
-  const user = await prisma.user.create({ data: { username, email, passwordHash: await argon2.hash(parsed.data.password, { type: argon2.argon2id }) } });
+  const user = await prisma.user.create({ data: { username, passwordHash: await argon2.hash(parsed.data.password, { type: argon2.argon2id }) } });
   await prisma.standardSlot.createMany({ data: Array.from({ length: 672 }, (_, i) => ({ userId: user.id, day: Math.floor(i / 96), slot: i % 96, available: false })) });
   req.session.userId = user.id;
   res.status(201).json({ user: { id: user.id, username: user.username } });
@@ -286,7 +332,7 @@ app.post("/api/auth/forgot-password", resetLimiter, asyncRoute(async (req, res) 
   const parsed = z.object({ email: z.string().trim().email().max(254) }).safeParse(req.body);
   if (!parsed.success) return res.status(200).json({ message: "If that account exists, recovery instructions will be sent." });
   const user = await prisma.user.findUnique({ where: { email: parsed.data.email.toLowerCase() } });
-  if (user) {
+  if (user?.email) {
     const rawToken = crypto.randomBytes(32).toString("base64url");
     const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
     await prisma.passwordResetToken.create({ data: { userId: user.id, tokenHash, expiresAt: new Date(Date.now() + 30 * 60 * 1000) } });

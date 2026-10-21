@@ -3,17 +3,17 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
   url      = env("DATABASE_URL")
 }
 
 model User {
   id                  String          @id @default(cuid())
-  username            String          @unique @db.VarChar(24)
-  email               String          @unique @db.VarChar(254)
+  username            String          @unique
+  email               String?         @unique
   passwordHash        String
   createdAt           DateTime        @default(now())
-  biweeklyAnchorWeekStart DateTime?    @db.Date
+  biweeklyAnchorWeekStart DateTime?
   standardSlots       StandardSlot[]
   customWeeks         CustomWeek[]
   ownedGroups         PlannerGroup[]  @relation("GroupOwner")
@@ -39,7 +39,7 @@ model StandardSlot {
 model CustomWeek {
   id        String       @id @default(cuid())
   userId    String
-  weekStart DateTime     @db.Date
+  weekStart DateTime
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
   user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -61,8 +61,8 @@ model CustomSlot {
 
 model PlannerGroup {
   id        String        @id @default(cuid())
-  name      String        @db.VarChar(60)
-  color     String        @default("#5667df") @db.VarChar(9)
+  name      String
+  color     String        @default("#5667df")
   ownerId   String
   createdAt DateTime      @default(now())
   owner     User          @relation("GroupOwner", fields: [ownerId], references: [id], onDelete: Cascade)
@@ -114,7 +114,7 @@ model GroupCustomSlot {
   id        String       @id @default(cuid())
   userId    String
   groupId   String
-  weekStart DateTime     @db.Date
+  weekStart DateTime
   day       Int
   slot      Int
   available Boolean
@@ -163,10 +163,10 @@ model BiweeklySlot {
 }
 
 model SessionStore {
-  sid    String   @id(map: "session_pkey") @db.VarChar
-  sess   Json     @db.Json
-  expire DateTime @db.Timestamp(6)
+  sid    String   @id
+  sess   String
+  expire DateTime
 
-  @@index([expire], map: "IDX_session_expire")
+  @@index([expire])
   @@map("user_sessions")
 }
