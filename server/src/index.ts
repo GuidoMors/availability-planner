@@ -249,9 +249,9 @@ async function hasConflictingGroupAssignments(groups: { groupId: string; slots: 
 }
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.post("/api/auth/register", authLimiter, asyncRoute(async (req, res) => {
-  const schema = z.object({ username: usernameSchema, password: z.string().min(12).max(128) });
+  const schema = z.object({ username: usernameSchema, password: z.string().min(6).max(128) });
   const parsed = schema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Username must be 3–24 letters/numbers/underscores; password must be 12–128 characters." });
+  if (!parsed.success) return res.status(400).json({ error: "Username must be 3–24 letters/numbers/underscores; password must be 6–128 characters." });
   const username = parsed.data.username.toLowerCase();
   if (await prisma.user.findUnique({ where: { username } })) return res.status(409).json({ error: "Username is already taken." });
   const recoveryKey = randomToken();
@@ -290,8 +290,8 @@ app.get("/api/auth/me", asyncRoute(async (req, res) => {
   else res.json({ user: null });
 }));
 app.post("/api/auth/migrate-password", requireAuth, asyncRoute(async (req, res) => {
-  const parsed = z.object({ password: z.string().min(12).max(128) }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Password must be 12–128 characters." });
+  const parsed = z.object({ password: z.string().min(6).max(128) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Password must be 6–128 characters." });
   const user = await prisma.user.findUnique({ where: { id: req.session.userId! }, select: { passwordHash: true } });
   if (!user) return res.status(401).json({ error: "Please log in." });
   if (!user.passwordHash.startsWith("$argon2")) return res.status(409).json({ error: "This account does not need a password migration." });
@@ -302,9 +302,9 @@ app.post("/api/auth/recover", resetLimiter, asyncRoute(async (req, res) => {
   const parsed = z.object({
     username: usernameSchema,
     recoveryKey: z.string().trim().min(20).max(200),
-    password: z.string().min(12).max(128)
+    password: z.string().min(6).max(128)
   }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Enter your username, recovery key, and a new password of at least 12 characters." });
+  if (!parsed.success) return res.status(400).json({ error: "Enter your username, recovery key, and a new password of at least 6 characters." });
 
   const user = await prisma.user.findUnique({ where: { username: parsed.data.username.toLowerCase() }, select: { id: true, recoveryKeyHash: true } });
   const keyHash = await sha256(parsed.data.recoveryKey);
@@ -333,17 +333,35 @@ app.put("/api/schedule/standard", requireAuth, asyncRoute(async (req, res) => {
   const incoming = new Map(parsed.data.map(slot => [`${slot.day}:${slot.slot}`, slot.available]));
   const biweeklyOverrides = biweekly.filter(row => row.available !== current[row.day][row.slot] && row.available !== incoming.get(`${row.day}:${row.slot}`));
   const redundantCustomIds = custom.filter(row => row.available === incoming.get(`${row.day}:${row.slot}`)).map(row => row.id);
-  await prisma.$transaction(async tx => {
-    await tx.biweeklySlot.deleteMany({ where: { userId, groupId: null } });
-    await Promise.all(parsed.data.map(slot => tx.standardSlot.update({
-      where: { userId_day_slot: { userId, day: slot.day, slot: slot.slot } },
-      data: { available: slot.available }
-    })));
-    if (redundantCustomIds.length) await tx.customSlot.deleteMany({ where: { id: { in: redundantCustomIds } } });
-    if (biweeklyOverrides.length) await tx.biweeklySlot.createMany({
-      data: biweeklyOverrides.map(row => ({ userId, groupId: null, parity: row.parity, day: row.day, slot: row.slot, available: row.available }))
-    });
-  });
+  const statements = [
+    req.env.DB.prepare('DELETE FROM "BiweeklySlot" WHERE "userId" = ?1 AND "groupId" IS NULL').bind(userId),
+    req.env.DB.prepare(`
+      UPDATE "StandardSlot"
+      SET "available" = json_extract(slot.value, '$.available')
+      FROM json_each(?1) AS slot
+      WHERE "StandardSlot"."userId" = ?2
+        AND "StandardSlot"."day" = json_extract(slot.value, '$.day')
+        AND "StandardSlot"."slot" = json_extract(slot.value, '$.slot')
+    `).bind(JSON.stringify(parsed.data), userId),
+    ...(redundantCustomIds.length ? [
+      req.env.DB.prepare(`
+        DELETE FROM "CustomSlot"
+        WHERE "id" IN (SELECT value FROM json_each(?1))
+      `).bind(JSON.stringify(redundantCustomIds))
+    ] : []),
+    ...(biweeklyOverrides.length ? [
+      req.env.DB.prepare(`
+        INSERT INTO "BiweeklySlot" ("id", "userId", "groupId", "parity", "day", "slot", "available")
+        SELECT json_extract(slot.value, '$.id'), ?1, NULL,
+          json_extract(slot.value, '$.parity'),
+          json_extract(slot.value, '$.day'),
+          json_extract(slot.value, '$.slot'),
+          json_extract(slot.value, '$.available')
+        FROM json_each(?2) AS slot
+      `).bind(userId, JSON.stringify(biweeklyOverrides.map(row => ({ ...row, id: crypto.randomUUID() }))))
+    ] : [])
+  ];
+  await req.env.DB.batch(statements);
   res.json({ slots: flatten(await getStandard(userId)) });
 }));
 app.get("/api/schedule/custom/:weekStart", requireAuth, asyncRoute(async (req, res) => {
@@ -412,21 +430,22 @@ app.put("/api/schedule/biweekly/:weekStart", requireAuth, asyncRoute(async (req,
     const assigned = group.slots.filter(slot => slot.available && !previous.has(`${slot.day}:${slot.slot}`));
     if (await hasGroupAssignmentConflict(group.groupId, assigned, weekStart, groupIds)) return res.status(409).json({ error: "One or more selected times are already reserved for another group." });
   }
-  await prisma.$transaction(async tx => {
-    if (!currentUser?.biweeklyAnchorWeekStart) await tx.user.update({ where: { id: userId }, data: { biweeklyAnchorWeekStart: anchor } });
-    await tx.biweeklySlot.deleteMany({ where: { userId, groupId: null, parity } });
-    const personalOverrides = parsed.data.everyone.filter(slot => slot.available !== standard[slot.day][slot.slot]);
-    if (personalOverrides.length) await tx.biweeklySlot.createMany({ data: personalOverrides.map(({ day, slot, available }) => ({ userId, parity, day, slot, available, groupId: null })) });
-    for (const group of parsed.data.groups) {
-      const schedule = await tx.groupBiweeklySchedule.upsert({
-        where: { groupId_parity: { groupId: group.groupId, parity } },
-        create: { groupId: group.groupId, parity },
-        update: {}
-      });
-      await tx.groupBiweeklySlot.deleteMany({ where: { scheduleId: schedule.id } });
-      await tx.groupBiweeklySlot.createMany({ data: group.slots.filter(slot => slot.available).map(slot => ({ scheduleId: schedule.id, day: slot.day, slot: slot.slot })) });
-    }
-  });
+  const schedules = await Promise.all(parsed.data.groups.map(group => prisma.groupBiweeklySchedule.upsert({
+    where: { groupId_parity: { groupId: group.groupId, parity } },
+    create: { groupId: group.groupId, parity },
+    update: {}
+  })));
+  const personalOverrides = parsed.data.everyone.filter(slot => slot.available !== standard[slot.day][slot.slot]);
+  const operations = [
+    ...(!currentUser?.biweeklyAnchorWeekStart ? [prisma.user.update({ where: { id: userId }, data: { biweeklyAnchorWeekStart: anchor } })] : []),
+    prisma.biweeklySlot.deleteMany({ where: { userId, groupId: null, parity } }),
+    ...(personalOverrides.length ? [prisma.biweeklySlot.createMany({ data: personalOverrides.map(({ day, slot, available }) => ({ userId, parity, day, slot, available, groupId: null })) })] : []),
+    ...parsed.data.groups.flatMap((group, index) => [
+      prisma.groupBiweeklySlot.deleteMany({ where: { scheduleId: schedules[index].id } }),
+      prisma.groupBiweeklySlot.createMany({ data: group.slots.filter(slot => slot.available).map(slot => ({ scheduleId: schedules[index].id, day: slot.day, slot: slot.slot })) })
+    ])
+  ];
+  await prisma.$transaction(operations);
   res.json({ weekStart, anchorWeekStart: anchor.toISOString().slice(0, 10), parity });
 }));
 app.delete("/api/schedule/biweekly/:weekStart", requireAuth, asyncRoute(async (req, res) => {
@@ -488,16 +507,17 @@ app.put("/api/schedule/group/:groupId/biweekly/:weekStart", requireAuth, asyncRo
   const owner = await prisma.user.findUnique({ where: { id: userId }, select: { biweeklyAnchorWeekStart: true } });
   const anchor = owner?.biweeklyAnchorWeekStart || monday(weekStart);
   const parity = weekParity(weekStart, anchor);
-  await prisma.$transaction(async tx => {
-    if (!owner?.biweeklyAnchorWeekStart) await tx.user.update({ where: { id: userId }, data: { biweeklyAnchorWeekStart: anchor } });
-    const schedule = await tx.groupBiweeklySchedule.upsert({
-      where: { groupId_parity: { groupId, parity } },
-      create: { groupId, parity },
-      update: {}
-    });
-    await tx.groupBiweeklySlot.deleteMany({ where: { scheduleId: schedule.id } });
-    await tx.groupBiweeklySlot.createMany({ data: parsed.data.filter(slot => slot.available).map(slot => ({ scheduleId: schedule.id, day: slot.day, slot: slot.slot })) });
+  const schedule = await prisma.groupBiweeklySchedule.upsert({
+    where: { groupId_parity: { groupId, parity } },
+    create: { groupId, parity },
+    update: {}
   });
+  const operations = [
+    ...(!owner?.biweeklyAnchorWeekStart ? [prisma.user.update({ where: { id: userId }, data: { biweeklyAnchorWeekStart: anchor } })] : []),
+    prisma.groupBiweeklySlot.deleteMany({ where: { scheduleId: schedule.id } }),
+    prisma.groupBiweeklySlot.createMany({ data: parsed.data.filter(slot => slot.available).map(slot => ({ scheduleId: schedule.id, day: slot.day, slot: slot.slot })) })
+  ];
+  await prisma.$transaction(operations);
   res.status(204).end();
 }));
 app.get("/api/schedule/group/:groupId/custom/:weekStart", requireAuth, asyncRoute(async (req, res) => {

@@ -98,7 +98,7 @@ Existing users have Argon2id hashes. That legacy hashing workload does not fit r
   ```
   The command displays the recovery key once and writes only its hash to the SQL file. Confirm Wrangler returns the intended username, share the key privately with that account owner, then securely delete the ignored SQL file. The user can then use **Forgot password** to set a new password. For an account without a valid session, this also replaces the legacy Argon2 password.
 
-New accounts receive a high-entropy recovery key displayed only once after signup. D1 stores only its SHA-256 hash. Recovery keys are single-use: successful recovery consumes the key, changes the password, and signs out existing sessions. New and recovered passwords are stored as PBKDF2-SHA-256 hashes using 100,000 iterations via Web Crypto, the iteration ceiling supported by Cloudflare Workers' Web Crypto implementation. The Worker enforces credentialed CORS, HTTP-only signed sessions, D1-backed rate limits, and the existing API route behavior.
+New accounts receive a high-entropy recovery key displayed only once after signup. D1 stores only its SHA-256 hash. Recovery keys are single-use: successful recovery consumes the key, changes the password, and signs out existing sessions. New, migrated, and recovered passwords must be 6–128 characters and are stored as PBKDF2-SHA-256 hashes using 100,000 iterations via Web Crypto, the iteration ceiling supported by Cloudflare Workers' Web Crypto implementation. The Worker enforces credentialed CORS, HTTP-only signed sessions, D1-backed rate limits, and the existing API route behavior.
 
 ## Useful commands
 
